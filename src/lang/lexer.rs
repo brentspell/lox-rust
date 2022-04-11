@@ -1,5 +1,5 @@
 /*!
-Lexical analyzer for the Lox language.
+# Lexical analyzer for the Lox language
 
 ## Usage
 ```
@@ -21,8 +21,8 @@ use lazy_static::lazy_static;
 use unicode_general_category as unicode_cat;
 use unicode_normalization::UnicodeNormalization;
 
-use crate::lang::{Token, TokenType, Value};
 use crate::lang::reader::{CharReaderIterator, LookaheadReader};
+use crate::lang::{Token, TokenType, Value};
 
 lazy_static! {
     // lox language reserved words and associated token types

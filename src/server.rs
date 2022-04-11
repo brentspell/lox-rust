@@ -1,8 +1,7 @@
 use crate::connection::Connection;
 use crate::control;
 use crate::jupyter::JupyterMessage;
-use crate::lang;
-use crate::lang::lexer::Lexer;
+use crate::lang::{lexer, parser};
 use anyhow::Result;
 use json::JsonValue;
 use std::collections::HashMap;
@@ -130,46 +129,40 @@ impl Server {
                 })
                 .send(&*self.iopub.lock().unwrap())?;
 
-            let output: Vec<Result<lang::Token>> = Lexer::from_str(src).collect();
-            if output.iter().all(|r| r.is_ok()) {
-                let result = output
-                    .into_iter()
-                    .map(|r| format!("{}", r.unwrap()))
-                    .collect::<Vec<String>>()
-                    .join("\n");
-                let data: HashMap<&str, &str> = HashMap::from([("text/plain", result.as_str())]);
-                message
-                    .new_message("execute_result")
-                    .with_content(object! {
+            match parser::Parser::new(Box::new(lexer::Lexer::from_str(src))).parse() {
+                Ok(expr) => {
+                    let result = format!("{}\n\n{:#?}", expr, expr);
+                    let data: HashMap<&str, &str> =
+                        HashMap::from([("text/plain", result.as_str())]);
+                    message
+                        .new_message("execute_result")
+                        .with_content(object! {
+                            "execution_count" => execution_count,
+                            "data" => data,
+                            "metadata" => object!(),
+                        })
+                        .send(&*self.iopub.lock().unwrap())?;
+                    execution_reply_sender.send(message.new_reply().with_content(object! {
+                        "status" => "ok",
                         "execution_count" => execution_count,
-                        "data" => data,
-                        "metadata" => object!(),
-                    })
-                    .send(&*self.iopub.lock().unwrap())?;
-                execution_reply_sender.send(message.new_reply().with_content(object! {
-                    "status" => "ok",
-                    "execution_count" => execution_count,
-                }))?;
-            } else {
-                let result = output
-                    .into_iter()
-                    .filter(|r| r.is_err())
-                    .map(|r| format!("\u{001b}[1;31mError\u{001b}[0m {}", r.unwrap_err()))
-                    .collect::<Vec<String>>()
-                    .join("\n");
-                message
-                    .new_message("error")
-                    .with_content(object! {
-                        "ename" => "Error",
-                        "evalue" => "lox error",
-                        "traceback" => array![result],
-                        "data" => "",
-                    })
-                    .send(&*self.iopub.lock().unwrap())?;
-                execution_reply_sender.send(message.new_reply().with_content(object! {
-                    "status" => "error",
-                    "execution_count" => execution_count
-                }))?;
+                    }))?;
+                }
+                Err(error) => {
+                    let result = format!("\u{001b}[1;31mError:\u{001b}[0m\n{}", error);
+                    message
+                        .new_message("error")
+                        .with_content(object! {
+                            "ename" => "Error",
+                            "evalue" => "lox error",
+                            "traceback" => array![result],
+                            "data" => "",
+                        })
+                        .send(&*self.iopub.lock().unwrap())?;
+                    execution_reply_sender.send(message.new_reply().with_content(object! {
+                        "status" => "error",
+                        "execution_count" => execution_count
+                    }))?;
+                }
             }
         }
     }
