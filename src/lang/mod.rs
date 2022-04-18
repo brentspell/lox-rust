@@ -4,6 +4,7 @@
 
 use std::fmt;
 
+pub mod interp;
 pub mod lexer;
 pub mod parser;
 mod reader;
@@ -143,8 +144,8 @@ This structure represents a literal/primitive value in the Lox language.
 pub enum Value {
     Nil,
     Boolean(bool),
-    Str(String),
     Num(f64),
+    Str(String),
 }
 
 impl fmt::Display for Value {
@@ -152,8 +153,14 @@ impl fmt::Display for Value {
         f.write_str(&match self {
             Value::Nil => "nil".to_string(),
             Value::Boolean(value) => value.to_string(),
+            Value::Num(value) => {
+                if value % 1.0 == 0.0 {
+                    (*value as i64).to_string()
+                } else {
+                    value.to_string()
+                }
+            }
             Value::Str(value) => format!("\"{value}\""),
-            Value::Num(value) => value.to_string(),
         })
     }
 }

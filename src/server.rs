@@ -1,7 +1,7 @@
 use crate::connection::Connection;
 use crate::control;
 use crate::jupyter::JupyterMessage;
-use crate::lang::{lexer, parser};
+use crate::lang::{interp, lexer, parser};
 use anyhow::Result;
 use json::JsonValue;
 use std::collections::HashMap;
@@ -129,9 +129,8 @@ impl Server {
                 })
                 .send(&*self.iopub.lock().unwrap())?;
 
-            match parser::Parser::new(Box::new(lexer::Lexer::from_str(src))).parse() {
-                Ok(expr) => {
-                    let result = format!("{}\n\n{:#?}", expr, expr);
+            match Self::process(src) {
+                Ok(result) => {
                     let data: HashMap<&str, &str> =
                         HashMap::from([("text/plain", result.as_str())]);
                     message
@@ -165,6 +164,11 @@ impl Server {
                 }
             }
         }
+    }
+
+    fn process(src: &str) -> Result<String> {
+        let expr = parser::Parser::new(Box::new(lexer::Lexer::from_str(src))).parse_all()?;
+        Ok(format!("{}", interp::eval(&expr)?))
     }
 
     fn handle_shell(

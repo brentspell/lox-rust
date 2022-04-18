@@ -53,6 +53,20 @@ impl Parser {
     by the default formatter, but individual errors can be accessed by downcasting the
     anyhow error and calling into_iter().
     */
+    pub fn parse_all(&mut self) -> Result<Expr> {
+        let expr = self.parse()?;
+        if let Some(tok) = self.peek(0)? {
+            bail!("expected end of input, found: {}", tok.lexeme);
+        }
+        Ok(expr)
+    }
+
+    /**
+    Parses the current token stream.
+
+    # Returns
+    A parse tree representing the user's program.
+    */
     pub fn parse(&mut self) -> Result<Expr> {
         let mut errors = ParseErrors::new();
         loop {
@@ -544,7 +558,7 @@ mod tests {
     }
 
     fn parse(string: &str) -> Result<Expr> {
-        Parser::new(Box::new(Lexer::from_str(string))).parse()
+        Parser::new(Box::new(Lexer::from_str(string))).parse_all()
     }
 
     fn roundtrip(string: &str) -> bool {
