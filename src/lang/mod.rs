@@ -47,9 +47,7 @@ impl fmt::Display for Token {
         write!(
             f,
             "line: {:4} type: {:12} lexeme: {}",
-            self.line,
-            self.typ.to_string(),
-            self.lexeme,
+            self.line, self.typ, self.lexeme,
         )
     }
 }
