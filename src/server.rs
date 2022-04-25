@@ -14,6 +14,7 @@ pub(crate) struct Server {
     latest_execution_request: Arc<Mutex<Option<JupyterMessage>>>,
     shutdown_requested_receiver: Arc<Mutex<mpsc::Receiver<()>>>,
     shutdown_requested_sender: Arc<Mutex<mpsc::Sender<()>>>,
+    interpreter: Arc<Mutex<interp::Interpreter>>,
 }
 
 impl Server {
@@ -50,6 +51,7 @@ impl Server {
             latest_execution_request: Arc::new(Mutex::new(None)),
             shutdown_requested_receiver: Arc::new(Mutex::new(shutdown_requested_receiver)),
             shutdown_requested_sender: Arc::new(Mutex::new(shutdown_requested_sender)),
+            interpreter: Arc::new(Mutex::new(interp::Interpreter::new())),
         };
 
         let (execution_sender, execution_receiver) = mpsc::channel();
@@ -110,7 +112,7 @@ impl Server {
     }
 
     fn handle_execution_requests(
-        self,
+        mut self,
         receiver: &mpsc::Receiver<JupyterMessage>,
         execution_reply_sender: &mpsc::Sender<JupyterMessage>,
     ) -> Result<()> {
@@ -129,7 +131,7 @@ impl Server {
                 })
                 .send(&*self.iopub.lock().unwrap())?;
 
-            match Self::process(src) {
+            match self.process(src) {
                 Ok(result) => {
                     let data: HashMap<&str, &str> =
                         HashMap::from([("text/plain", result.as_str())]);
@@ -166,9 +168,9 @@ impl Server {
         }
     }
 
-    fn process(src: &str) -> Result<String> {
-        let expr = parser::Parser::new(Box::new(lexer::Lexer::from_str(src))).parse_all()?;
-        Ok(format!("{}", interp::eval(&expr)?))
+    fn process(&mut self, src: &str) -> Result<String> {
+        let program = parser::Parser::new(Box::new(lexer::Lexer::from_str(src))).parse()?;
+        self.interpreter.lock().unwrap().eval(&program)
     }
 
     fn handle_shell(

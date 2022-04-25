@@ -14,10 +14,10 @@ dbg!(expr);
 
 use std::fmt;
 
-use anyhow::{bail, Error, Result};
+use anyhow::{anyhow, bail, Error, Result};
 
 use crate::lang::reader::LookaheadReader;
-use crate::lang::{Expr, Token, TokenType, Value};
+use crate::lang::{Expr, Program, Stmt, Token, TokenType, Value};
 
 /**
 This struct maintains the current state of the parser as it progresses through the token
@@ -53,28 +53,50 @@ impl Parser {
     by the default formatter, but individual errors can be accessed by downcasting the
     anyhow error and calling into_iter().
     */
-    pub fn parse_all(&mut self) -> Result<Expr> {
-        let expr = self.parse()?;
-        if let Some(tok) = self.peek(0)? {
-            bail!("expected end of input, found: {}", tok.lexeme);
+    pub fn parse(&mut self) -> Result<Program> {
+        let mut stmts = Vec::new();
+        let mut errors = ParseErrors::new();
+
+        // parse the whole program
+        loop {
+            match self.declaration() {
+                Ok(None) => break,
+                Ok(Some(stmt)) => stmts.push(stmt),
+                Err(error) => {
+                    // parse error, attempt to sync so we can collect more errors
+                    errors.push(error);
+                    match self.synchronize() {
+                        Ok(true) => continue,
+                        Ok(false) => break,
+                        Err(error) => errors.push(error),
+                    }
+                }
+            }
         }
-        Ok(expr)
+
+        // return failure if any parse errors were encountered
+        if !errors.is_empty() {
+            bail!(errors);
+        }
+
+        Ok(Program { stmts })
     }
 
     /**
-    Parses the current token stream.
+    Parses a single expression from the token stream. Consumes the whole stream.
 
     # Returns
     A parse tree representing the user's program.
     */
-    pub fn parse(&mut self) -> Result<Expr> {
+    #[allow(dead_code)]
+    pub fn parse_expr(&mut self) -> Result<Expr> {
         let mut errors = ParseErrors::new();
-        loop {
-            // continue parsing, only return an expression if no errors occurred
-            match (self.expression(), errors.is_empty()) {
-                (Ok(expr), true) => break Ok(expr),
-                (Ok(_), false) => bail!(errors),
-                (Err(error), _) => {
+
+        // parse until we hit the first valid expression
+        let expr = loop {
+            match self.expression() {
+                Ok(expr) => break expr,
+                Err(error) => {
                     // parse error, attempt to sync so we can collect more errors
                     errors.push(error);
                     match self.synchronize() {
@@ -84,11 +106,126 @@ impl Parser {
                     }
                 }
             }
+        };
+
+        // ensure we have consumed the whole input
+        match self.peek(0) {
+            Ok(None) => (),
+            Ok(Some(tok)) => errors.push(anyhow!(
+                "line {}: expected end of input, found: {}",
+                tok.line,
+                tok.lexeme
+            )),
+            Err(error) => errors.push(error),
+        }
+
+        // return failure if any parse errors were encountered
+        if !errors.is_empty() {
+            bail!(errors);
+        }
+
+        Ok(expr)
+    }
+
+    fn declaration(&mut self) -> Result<Option<Stmt>> {
+        match self.peek_type(0)? {
+            None => Ok(None),
+            Some(TokenType::Var) => {
+                self.read()?;
+
+                // match the variable name
+                let var = self.read()?;
+                if var.typ != TokenType::Identifier {
+                    bail!(
+                        "line {}: expected identifier, found {}",
+                        var.line,
+                        var.lexeme
+                    );
+                }
+
+                // match the optional variable value
+                let val = if self.peek_type(0)? == Some(TokenType::Equal) {
+                    self.read()?;
+                    self.expression()?
+                } else {
+                    Expr::Literal(Value::Nil)
+                };
+
+                // match the statement terminator
+                let end = self.read()?;
+                if end.typ != TokenType::Semicolon {
+                    bail!(
+                        "line {}: expected ; or expression, found {}",
+                        end.line,
+                        end.lexeme
+                    );
+                }
+                Ok(Some(Stmt::Decl(var, val)))
+            }
+
+            _ => Ok(Some(self.statement()?)),
         }
     }
 
+    fn statement(&mut self) -> Result<Stmt> {
+        let stmt = match self.peek_type(0)? {
+            // match special forms
+            Some(TokenType::Print) => {
+                self.read()?;
+                Stmt::Print(self.expression()?)
+            }
+
+            // match blocks
+            Some(TokenType::LeftBrace) => {
+                return Ok(Stmt::Block(self.block()?));
+            }
+
+            // everything else is an expression statement
+            _ => Stmt::Expr(self.expression()?),
+        };
+
+        // match the statement terminator
+        let end = self.read()?;
+        if end.typ != TokenType::Semicolon {
+            bail!("line {}: expected ; found {}", end.line, end.lexeme);
+        }
+
+        Ok(stmt)
+    }
+
+    fn block(&mut self) -> Result<Vec<Stmt>> {
+        let mut statements = Vec::new();
+
+        self.read()?;
+        loop {
+            match self.peek_type(0)? {
+                Some(TokenType::RightBrace) => break,
+                Some(_) => statements.push(self.declaration()?.unwrap()),
+                None => bail!("unexpected end of input"),
+            }
+        }
+        self.read()?;
+
+        Ok(statements)
+    }
+
     fn expression(&mut self) -> Result<Expr> {
-        self.equality()
+        self.assignment()
+    }
+
+    fn assignment(&mut self) -> Result<Expr> {
+        let lhs = self.equality()?;
+        match self.peek_type(0)? {
+            Some(TokenType::Equal) => {
+                self.read()?;
+                let rhs = self.assignment()?;
+                match lhs {
+                    Expr::Variable(tok) => Ok(Expr::Assignment(tok, Box::new(rhs))),
+                    _ => bail!("invalid assignment target: {}", lhs),
+                }
+            }
+            _ => Ok(lhs),
+        }
     }
 
     fn equality(&mut self) -> Result<Expr> {
@@ -139,9 +276,10 @@ impl Parser {
             TokenType::True => Expr::Literal(Value::Boolean(true)),
             TokenType::Number => Expr::Literal(tok.literal),
             TokenType::String => Expr::Literal(tok.literal),
+            TokenType::Identifier => Expr::Variable(tok),
             TokenType::LeftParen => self.grouping()?,
             _ => bail!(
-                "line {}: expected literal or (, found {}",
+                "line {}: expected expression, found {}",
                 tok.line,
                 tok.lexeme
             ),
@@ -188,7 +326,7 @@ impl Parser {
         if let Some(tok) = self.reader.read()? {
             Ok(tok)
         } else {
-            bail!("unexpected end of input")
+            bail!("unexpected end of input, missing ; perhaps?")
         }
     }
 
@@ -258,34 +396,92 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_errors() {
-        assert!(parse("")
-            .unwrap_err()
-            .to_string()
-            .contains("unexpected end of input"));
-        assert!(parse("😀")
+    fn test_stmt_errors() {
+        assert!(parse("😟;")
             .unwrap_err()
             .to_string()
             .contains("unexpected character"));
-        assert!(parse("+")
+        assert_eq!(
+            parse("😀;1😀")
+                .unwrap_err()
+                .downcast::<ParseErrors>()
+                .unwrap()
+                .into_iter()
+                .count(),
+            2
+        );
+
+        assert!(parse("var;")
             .unwrap_err()
             .to_string()
-            .contains("expected literal or ("));
-        assert!(parse("(")
+            .contains("expected identifier, found ;"));
+        assert!(parse("var 42 = 1;")
+            .unwrap_err()
+            .to_string()
+            .contains("expected identifier, found 42"));
+        assert!(parse("var x =;")
+            .unwrap_err()
+            .to_string()
+            .contains("expected expression, found ;"));
+        assert!(parse("var x 42;")
+            .unwrap_err()
+            .to_string()
+            .contains("expected ; or expression, found 42"));
+        assert!(parse("var x = 42")
             .unwrap_err()
             .to_string()
             .contains("unexpected end of input"));
-        assert!(parse("(1")
+        assert!(parse("print 42")
+            .unwrap_err()
+            .to_string()
+            .contains("unexpected end of input"));
+        assert!(parse("print;")
+            .unwrap_err()
+            .to_string()
+            .contains("expected expression, found ;"));
+        assert!(parse("{")
+            .unwrap_err()
+            .to_string()
+            .contains("unexpected end of input"));
+        assert!(parse("{{}")
+            .unwrap_err()
+            .to_string()
+            .contains("unexpected end of input"));
+    }
+
+    #[test]
+    fn test_expr_errors() {
+        assert!(parse_expr("")
+            .unwrap_err()
+            .to_string()
+            .contains("unexpected end of input"));
+        assert!(parse_expr("😀")
+            .unwrap_err()
+            .to_string()
+            .contains("unexpected character"));
+        assert!(parse_expr("+")
+            .unwrap_err()
+            .to_string()
+            .contains("expected expression"));
+        assert!(parse_expr("(")
+            .unwrap_err()
+            .to_string()
+            .contains("unexpected end of input"));
+        assert!(parse_expr("(1")
             .unwrap_err()
             .to_string()
             .contains("expected ) after expression, found end of input"));
-        assert!(parse("(1 2")
+        assert!(parse_expr("(1 2")
             .unwrap_err()
             .to_string()
             .contains("expected ) after expression"));
+        assert!(parse_expr("1 = 2")
+            .unwrap_err()
+            .to_string()
+            .contains("invalid assignment target"));
 
         assert_eq!(
-            parse("")
+            parse_expr("")
                 .unwrap_err()
                 .downcast::<ParseErrors>()
                 .unwrap()
@@ -294,7 +490,7 @@ mod tests {
             1
         );
         assert_eq!(
-            parse("😀;1😀")
+            parse_expr("😀;1😀")
                 .unwrap_err()
                 .downcast::<ParseErrors>()
                 .unwrap()
@@ -306,46 +502,51 @@ mod tests {
 
     #[test]
     fn test_primary() {
-        assert!(roundtrip("nil"));
-        assert!(roundtrip("true"));
-        assert!(roundtrip("false"));
-        assert!(roundtrip("42"));
-        assert!(roundtrip(r#""test""#));
+        assert!(roundtrip_expr("nil"));
+        assert!(roundtrip_expr("true"));
+        assert!(roundtrip_expr("false"));
+        assert!(roundtrip_expr("42"));
+        assert!(roundtrip_expr(r#""test""#));
+        assert!(roundtrip_expr("x"));
 
-        assert!(matches!(parse("nil"), Ok(Expr::Literal(Value::Nil))));
+        assert!(matches!(parse_expr("nil"), Ok(Expr::Literal(Value::Nil))));
         assert!(matches!(
-            parse("true"),
+            parse_expr("true"),
             Ok(Expr::Literal(Value::Boolean(true)))
         ));
         assert!(matches!(
-            parse("false"),
+            parse_expr("false"),
             Ok(Expr::Literal(Value::Boolean(false)))
         ));
         assert!(matches!(
-            parse("42"),
+            parse_expr("42"),
             Ok(Expr::Literal(Value::Num(x))) if x == 42.0
         ));
         assert!(matches!(
-            parse(r#""test""#),
+            parse_expr(r#""test""#),
             Ok(Expr::Literal(Value::Str(s))) if s == "test"
+        ));
+        assert!(matches!(
+            parse_expr("x"),
+            Ok(Expr::Variable(tok)) if tok.lexeme == "x"
         ));
     }
 
     #[test]
     fn test_unary() {
-        assert!(roundtrip("-1"));
-        assert!(roundtrip("--2"));
-        assert!(roundtrip("!true"));
-        assert!(roundtrip("!!false"));
+        assert!(roundtrip_expr("-1"));
+        assert!(roundtrip_expr("--2"));
+        assert!(roundtrip_expr("!true"));
+        assert!(roundtrip_expr("!!false"));
 
-        match parse("-1") {
+        match parse_expr("-1") {
             Ok(Expr::Unary(op, value)) => {
                 assert_eq!(op.typ, TokenType::Minus);
                 assert!(matches!(*value, Expr::Literal(Value::Num(x)) if x == 1.0));
             }
             _ => panic!(),
         }
-        match parse("!!true") {
+        match parse_expr("!!true") {
             Ok(Expr::Unary(op1, expr2)) => {
                 assert_eq!(op1.typ, TokenType::Bang);
                 match *expr2 {
@@ -362,11 +563,11 @@ mod tests {
 
     #[test]
     fn test_factor() {
-        assert!(roundtrip("1 * 2"));
-        assert!(roundtrip("3 / 4"));
-        assert!(roundtrip("1 * 2 / 3"));
+        assert!(roundtrip_expr("1 * 2"));
+        assert!(roundtrip_expr("3 / 4"));
+        assert!(roundtrip_expr("1 * 2 / 3"));
 
-        match parse("1 * 2") {
+        match parse_expr("1 * 2") {
             Ok(Expr::Binary(value1, op, value2)) => {
                 assert_eq!(op.typ, TokenType::Star);
                 assert!(matches!(*value1, Expr::Literal(Value::Num(x)) if x == 1.0));
@@ -375,7 +576,7 @@ mod tests {
             _ => panic!(),
         }
 
-        match parse("1 * 2 / 3") {
+        match parse_expr("1 * 2 / 3") {
             Ok(Expr::Binary(expr1, op2, value3)) => {
                 assert_eq!(op2.typ, TokenType::Slash);
                 assert!(matches!(*value3, Expr::Literal(Value::Num(x)) if x == 3.0));
@@ -394,11 +595,11 @@ mod tests {
 
     #[test]
     fn test_term() {
-        assert!(roundtrip("1 + 2"));
-        assert!(roundtrip("3 - 4"));
-        assert!(roundtrip("1 + 2 - 3"));
+        assert!(roundtrip_expr("1 + 2"));
+        assert!(roundtrip_expr("3 - 4"));
+        assert!(roundtrip_expr("1 + 2 - 3"));
 
-        match parse("1 + 2") {
+        match parse_expr("1 + 2") {
             Ok(Expr::Binary(value1, op, value2)) => {
                 assert_eq!(op.typ, TokenType::Plus);
                 assert!(matches!(*value1, Expr::Literal(Value::Num(x)) if x == 1.0));
@@ -407,7 +608,7 @@ mod tests {
             _ => panic!(),
         }
 
-        match parse("1 + 2 - 3") {
+        match parse_expr("1 + 2 - 3") {
             Ok(Expr::Binary(expr1, op2, value3)) => {
                 assert_eq!(op2.typ, TokenType::Minus);
                 assert!(matches!(*value3, Expr::Literal(Value::Num(x)) if x == 3.0));
@@ -426,11 +627,11 @@ mod tests {
 
     #[test]
     fn test_comparison() {
-        assert!(roundtrip("1 > 2"));
-        assert!(roundtrip("3 >= 4"));
-        assert!(roundtrip("1 < 2 <= 3"));
+        assert!(roundtrip_expr("1 > 2"));
+        assert!(roundtrip_expr("3 >= 4"));
+        assert!(roundtrip_expr("1 < 2 <= 3"));
 
-        match parse("1 > 2") {
+        match parse_expr("1 > 2") {
             Ok(Expr::Binary(value1, op, value2)) => {
                 assert_eq!(op.typ, TokenType::Greater);
                 assert!(matches!(*value1, Expr::Literal(Value::Num(x)) if x == 1.0));
@@ -439,7 +640,7 @@ mod tests {
             _ => panic!(),
         }
 
-        match parse("1 < 2 <= 3") {
+        match parse_expr("1 < 2 <= 3") {
             Ok(Expr::Binary(expr1, op2, value3)) => {
                 assert_eq!(op2.typ, TokenType::LessEqual);
                 assert!(matches!(*value3, Expr::Literal(Value::Num(x)) if x == 3.0));
@@ -458,11 +659,11 @@ mod tests {
 
     #[test]
     fn test_equality() {
-        assert!(roundtrip("1 == 2"));
-        assert!(roundtrip("3 != 4"));
-        assert!(roundtrip("1 == 2 != 3"));
+        assert!(roundtrip_expr("1 == 2"));
+        assert!(roundtrip_expr("3 != 4"));
+        assert!(roundtrip_expr("1 == 2 != 3"));
 
-        match parse("1 == 2") {
+        match parse_expr("1 == 2") {
             Ok(Expr::Binary(value1, op, value2)) => {
                 assert_eq!(op.typ, TokenType::EqualEqual);
                 assert!(matches!(*value1, Expr::Literal(Value::Num(x)) if x == 1.0));
@@ -471,7 +672,7 @@ mod tests {
             _ => panic!(),
         }
 
-        match parse("1 == 2 != 3") {
+        match parse_expr("1 == 2 != 3") {
             Ok(Expr::Binary(expr1, op2, value3)) => {
                 assert_eq!(op2.typ, TokenType::BangEqual);
                 assert!(matches!(*value3, Expr::Literal(Value::Num(x)) if x == 3.0));
@@ -489,19 +690,33 @@ mod tests {
     }
 
     #[test]
-    fn test_grouping() {
-        assert!(roundtrip("(1)"));
-        assert!(roundtrip("(1 + 2) * 3"));
-        assert!(roundtrip("3 * (1 + 2)"));
+    fn test_assignment() {
+        assert!(roundtrip_expr("x = 1"));
+        assert!(roundtrip_expr("y = x + 1"));
 
-        match parse("(1)") {
+        match parse_expr("x = 1") {
+            Ok(Expr::Assignment(var, expr)) => {
+                assert_eq!(var.typ, TokenType::Identifier);
+                assert!(matches!(*expr, Expr::Literal(Value::Num(x)) if x == 1.0));
+            }
+            _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn test_grouping() {
+        assert!(roundtrip_expr("(1)"));
+        assert!(roundtrip_expr("(1 + 2) * 3"));
+        assert!(roundtrip_expr("3 * (1 + 2)"));
+
+        match parse_expr("(1)") {
             Ok(Expr::Grouping(value)) => {
                 assert!(matches!(*value, Expr::Literal(Value::Num(x)) if x == 1.0));
             }
             _ => panic!(),
         }
 
-        match parse("3 * (1 + 2)") {
+        match parse_expr("3 * (1 + 2)") {
             Ok(Expr::Binary(value3, op2, expr1)) => {
                 assert_eq!(op2.typ, TokenType::Star);
                 assert!(matches!(*value3, Expr::Literal(Value::Num(x)) if x == 3.0));
@@ -523,9 +738,9 @@ mod tests {
 
     #[test]
     fn test_precedence() {
-        assert!(roundtrip("1 == 2 < 3 + 4 * -5"));
+        assert!(roundtrip_expr("1 == 2 < 3 + 4 * -5"));
 
-        match parse("1 == 2 < 3 + 4 * -5") {
+        match parse_expr("1 == 2 < 3 + 4 * -5") {
             Ok(Expr::Binary(_, eqop, eq2)) => {
                 assert_eq!(eqop.typ, TokenType::EqualEqual);
                 match *eq2 {
@@ -557,11 +772,115 @@ mod tests {
         }
     }
 
-    fn parse(string: &str) -> Result<Expr> {
-        Parser::new(Box::new(Lexer::from_str(string))).parse_all()
+    #[test]
+    fn test_statements() {
+        assert!(roundtrip(""));
+        assert!(parse("").unwrap().stmts.is_empty());
+    }
+
+    #[test]
+    fn test_decl_stmt() {
+        assert!(roundtrip("var x;"));
+        assert!(roundtrip("var y = 42;"));
+
+        match &parse("var x;").unwrap().stmts[0] {
+            Stmt::Decl(tok, expr) => {
+                assert_eq!(tok.typ, TokenType::Identifier);
+                assert_eq!(tok.lexeme, "x");
+                match expr {
+                    Expr::Literal(value) => assert_eq!(*value, Value::Nil),
+                    _ => panic!(),
+                }
+            }
+            _ => panic!(),
+        }
+
+        match &parse("var y = 42;").unwrap().stmts[0] {
+            Stmt::Decl(tok, expr) => {
+                assert_eq!(tok.typ, TokenType::Identifier);
+                assert_eq!(tok.lexeme, "y");
+                match expr {
+                    Expr::Literal(value) => assert_eq!(*value, Value::Num(42.0)),
+                    _ => panic!(),
+                }
+            }
+            _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn test_expr_stmt() {
+        assert!(roundtrip("42;"));
+
+        match &parse("42;").unwrap().stmts[0] {
+            Stmt::Expr(expr) => match expr {
+                Expr::Literal(value) => assert_eq!(*value, Value::Num(42.0)),
+                _ => panic!(),
+            },
+            _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn test_print_stmt() {
+        assert!(roundtrip("print x;"));
+
+        match &parse("print x;").unwrap().stmts[0] {
+            Stmt::Print(expr) => match expr {
+                Expr::Variable(tok) => assert_eq!(tok.lexeme, "x"),
+                _ => panic!(),
+            },
+            _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn test_stmt_block() {
+        assert!(roundtrip("{\n}\n"));
+        assert!(roundtrip("{\nvar x = 1;}\n"));
+
+        match &parse("{ var x = 1; var y = 2; }").unwrap().stmts[0] {
+            Stmt::Block(stmts) => {
+                match &stmts[0] {
+                    Stmt::Decl(tok, expr) => {
+                        assert_eq!(tok.typ, TokenType::Identifier);
+                        assert_eq!(tok.lexeme, "x");
+                        match expr {
+                            Expr::Literal(value) => assert_eq!(*value, Value::Num(1.0)),
+                            _ => panic!(),
+                        }
+                    }
+                    _ => panic!(),
+                }
+                match &stmts[1] {
+                    Stmt::Decl(tok, expr) => {
+                        assert_eq!(tok.typ, TokenType::Identifier);
+                        assert_eq!(tok.lexeme, "y");
+                        match expr {
+                            Expr::Literal(value) => assert_eq!(*value, Value::Num(2.0)),
+                            _ => panic!(),
+                        }
+                    }
+                    _ => panic!(),
+                }
+            }
+            _ => panic!(),
+        }
+    }
+
+    fn parse(string: &str) -> Result<Program> {
+        Parser::new(Box::new(Lexer::from_str(string))).parse()
     }
 
     fn roundtrip(string: &str) -> bool {
         format!("{}", parse(string).unwrap()) == string
+    }
+
+    fn parse_expr(string: &str) -> Result<Expr> {
+        Parser::new(Box::new(Lexer::from_str(string))).parse_expr()
+    }
+
+    fn roundtrip_expr(string: &str) -> bool {
+        format!("{}", parse_expr(string).unwrap()) == string
     }
 }

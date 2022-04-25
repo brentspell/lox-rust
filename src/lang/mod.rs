@@ -4,29 +4,86 @@
 
 use std::fmt;
 
+mod env;
 pub mod interp;
 pub mod lexer;
 pub mod parser;
 mod reader;
 
+#[derive(Debug)]
+pub struct Program {
+    stmts: Vec<Stmt>,
+}
+
+impl fmt::Display for Program {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        for (i, e) in self.stmts.iter().enumerate() {
+            if i > 0 {
+                writeln!(f)?;
+            }
+            e.fmt(f)?;
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug)]
+pub enum Stmt {
+    Block(Vec<Stmt>),
+    Decl(Token, Expr),
+    Expr(Expr),
+    Print(Expr),
+}
+
+impl fmt::Display for Stmt {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match self {
+            Self::Block(stmts) => {
+                writeln!(f, "{{")?;
+                for (i, e) in stmts.iter().enumerate() {
+                    if i > 0 {
+                        writeln!(f)?;
+                    }
+                    e.fmt(f)?;
+                }
+                writeln!(f, "}}")?;
+                Ok(())
+            }
+            Self::Decl(tok, expr) => {
+                if let Expr::Literal(Value::Nil) = expr {
+                    write!(f, "var {};", tok.lexeme)
+                } else {
+                    write!(f, "var {} = {};", tok.lexeme, expr)
+                }
+            }
+            Self::Expr(expr) => write!(f, "{};", expr),
+            Self::Print(expr) => write!(f, "print {};", expr),
+        }
+    }
+}
+
 /**
 This enumeration represents an Abstract Syntax Tree (AST) for an expression in Lox.
 */
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub enum Expr {
+    Assignment(Token, Box<Expr>),
     Binary(Box<Expr>, Token, Box<Expr>),
     Grouping(Box<Expr>),
     Literal(Value),
     Unary(Token, Box<Expr>),
+    Variable(Token),
 }
 
 impl fmt::Display for Expr {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self {
+            Self::Assignment(var, expr) => write!(f, "{} = {}", var.lexeme, expr),
             Self::Binary(lhs, op, rhs) => write!(f, "{} {} {}", lhs, op.lexeme, rhs),
             Self::Grouping(expr) => write!(f, "({})", expr),
             Self::Literal(value) => write!(f, "{}", value),
             Self::Unary(op, expr) => write!(f, "{}{}", op.lexeme, expr),
+            Self::Variable(var) => write!(f, "{}", var.lexeme),
         }
     }
 }
@@ -34,7 +91,7 @@ impl fmt::Display for Expr {
 /**
 The token structure is the lexical unit in the Lox language.
 */
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct Token {
     pub typ: TokenType,
     pub line: u32,
