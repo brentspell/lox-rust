@@ -7,11 +7,14 @@ used or assigned to. If values are not defined in the current environment, the g
 is forwarded to the parent environment.
 */
 
+use std::cell::RefCell;
 use std::collections::HashMap;
 
 use anyhow::{bail, Result};
 
 use crate::lang::{Token, Value};
+
+type ValueCell = RefCell<Value>;
 
 /**
 This struct stores the values of all variables used by the interpreter. Scoping is accomplished
@@ -21,7 +24,7 @@ an empty mapping.
 #[derive(Debug, Default)]
 pub struct Env {
     parent: Option<Box<Env>>,
-    data: HashMap<String, Value>,
+    data: HashMap<String, ValueCell>,
 }
 
 impl Env {
@@ -51,7 +54,7 @@ impl Env {
     * `value` - the value to assign
 
     */
-    pub fn define(&mut self, name: &str, value: Value) {
+    pub fn define(&mut self, name: &str, value: ValueCell) {
         self.data.insert(name.to_string(), value);
     }
 
@@ -65,9 +68,9 @@ impl Env {
     # Returns
     The value of the requested variable, or error if it was not defined.
     */
-    pub fn get(&self, tok: &Token) -> Result<&Value> {
+    pub fn get(&self, tok: &Token) -> Result<ValueCell> {
         match self.data.get(&tok.lexeme) {
-            Some(value) => Ok(value),
+            Some(value) => Ok(value.clone()),
             None => match &self.parent {
                 Some(parent) => Ok(parent.get(tok)?),
                 None => bail!("line {}: undefined variable {}", tok.line, tok.lexeme),
@@ -86,7 +89,7 @@ impl Env {
     # Returns
     Ok if the variable was assigned, or error if was not defined.
     */
-    pub fn assign(&mut self, tok: &Token, value: Value) -> Result<()> {
+    pub fn assign(&mut self, tok: &Token, value: ValueCell) -> Result<()> {
         if self.data.contains_key(&tok.lexeme) {
             self.data.insert(tok.lexeme.to_string(), value);
             Ok(())
@@ -127,18 +130,18 @@ mod tests {
             .to_string()
             .contains("undefined variable"));
         assert!(env
-            .assign(&x, Value::Num(2.0))
+            .assign(&x, ValueCell::new(Value::Num(2.0)))
             .unwrap_err()
             .to_string()
             .contains("undefined variable"));
 
-        env.define(&x.lexeme, x.literal.clone());
-        env.define(&y.lexeme, y.literal.clone());
-        assert_eq!(*env.get(&x).unwrap(), x.literal);
-        assert_eq!(*env.get(&y).unwrap(), y.literal);
+        env.define(&x.lexeme, ValueCell::new(x.literal.clone()));
+        env.define(&y.lexeme, ValueCell::new(y.literal.clone()));
+        assert_eq!(*env.get(&x).unwrap().borrow(), x.literal);
+        assert_eq!(*env.get(&y).unwrap().borrow(), y.literal);
 
-        env.assign(&x, y.literal.clone()).unwrap();
-        assert_eq!(*env.get(&x).unwrap(), y.literal);
+        env.assign(&x, ValueCell::new(y.literal.clone())).unwrap();
+        assert_eq!(*env.get(&x).unwrap().borrow(), y.literal);
     }
 
     #[test]
@@ -157,17 +160,17 @@ mod tests {
             literal: Value::Num(2.0),
         };
 
-        env.define(&x.lexeme, x.literal.clone());
-        env.define(&y.lexeme, y.literal.clone());
+        env.define(&x.lexeme, ValueCell::new(x.literal.clone()));
+        env.define(&y.lexeme, ValueCell::new(y.literal.clone()));
 
         let mut env = env.push();
-        env.define(&x.lexeme, y.literal.clone());
-        env.assign(&y, x.literal.clone()).unwrap();
-        assert_eq!(*env.get(&x).unwrap(), y.literal);
-        assert_eq!(*env.get(&y).unwrap(), x.literal);
+        env.define(&x.lexeme, ValueCell::new(y.literal.clone()));
+        env.assign(&y, ValueCell::new(x.literal.clone())).unwrap();
+        assert_eq!(*env.get(&x).unwrap().borrow(), y.literal);
+        assert_eq!(*env.get(&y).unwrap().borrow(), x.literal);
 
         let env = env.pop().unwrap();
-        assert_eq!(*env.get(&x).unwrap(), x.literal);
-        assert_eq!(*env.get(&y).unwrap(), x.literal);
+        assert_eq!(*env.get(&x).unwrap().borrow(), x.literal);
+        assert_eq!(*env.get(&y).unwrap().borrow(), x.literal);
     }
 }

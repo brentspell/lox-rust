@@ -14,10 +14,14 @@ dbg!(result);
 
 */
 
+use std::cell::RefCell;
+
 use anyhow::{bail, Result};
 
 use crate::lang::env::Env;
 use crate::lang::{Expr, Program, Stmt, Token, TokenType as TT, Value, Value::*};
+
+type ValueCell = RefCell<Value>;
 
 /**
 This struct maintains the current state of the interpreter between program evaluations.
@@ -84,7 +88,7 @@ impl Interpreter {
             }
             Stmt::Print(expr) => {
                 // evaluate and write to stdout
-                format!("{}\n", self.eval_expr(expr)?)
+                format!("{}\n", self.eval_expr(expr)?.borrow())
             }
         })
     }
@@ -98,43 +102,46 @@ impl Interpreter {
     # Returns
     The result value of the evaluated expression.
     */
-    pub fn eval_expr(&mut self, expr: &Expr) -> Result<Value> {
+    pub fn eval_expr(&mut self, expr: &Expr) -> Result<ValueCell> {
         Ok(match expr {
             Expr::Assignment(var, expr) => self.eval_assign(var, expr)?,
             Expr::Binary(lhs, tok, rhs) => self.eval_binary(lhs, tok, rhs)?,
             Expr::Grouping(expr) => self.eval_expr(expr)?,
-            Expr::Literal(value) => value.clone(),
+            Expr::Literal(value) => ValueCell::new(value.clone()),
             Expr::Unary(tok, expr) => self.eval_unary(tok, expr)?,
-            Expr::Variable(tok) => self.env.get(tok)?.clone(),
+            Expr::Variable(tok) => self.env.get(tok)?,
         })
     }
 
-    fn eval_assign(&mut self, var: &Token, expr: &Expr) -> Result<Value> {
+    fn eval_assign(&mut self, var: &Token, expr: &Expr) -> Result<ValueCell> {
         let value = self.eval_expr(expr)?;
         self.env.assign(var, value.clone())?;
         Ok(value)
     }
 
-    fn eval_binary(&mut self, lhs: &Expr, tok: &Token, rhs: &Expr) -> Result<Value> {
+    fn eval_binary(&mut self, lhs: &Expr, tok: &Token, rhs: &Expr) -> Result<ValueCell> {
         let lhs = self.eval_expr(lhs)?;
         let rhs = self.eval_expr(rhs)?;
+        let lhs = &*lhs.borrow();
+        let rhs = &*rhs.borrow();
         Ok(match tok.typ {
-            TT::Plus | TT::Slash | TT::Star | TT::Minus => self.eval_arithmetic(&lhs, tok, &rhs)?,
+            TT::Plus | TT::Slash | TT::Star | TT::Minus => self.eval_arithmetic(lhs, tok, rhs)?,
             TT::Greater | TT::GreaterEqual | TT::Less | TT::LessEqual => {
-                self.eval_comparison(&lhs, tok, &rhs)?
+                self.eval_comparison(lhs, tok, rhs)?
             }
-            TT::EqualEqual => Boolean(self.eval_equality(&lhs, &rhs)),
-            TT::BangEqual => Boolean(!self.eval_equality(&lhs, &rhs)),
+            TT::EqualEqual => ValueCell::new(Boolean(self.eval_equality(lhs, rhs))),
+            TT::BangEqual => ValueCell::new(Boolean(!self.eval_equality(lhs, rhs))),
             typ => panic!("invalid binary: {}", typ),
         })
     }
 
-    fn eval_unary(&mut self, tok: &Token, expr: &Expr) -> Result<Value> {
-        let expr = self.eval_expr(expr)?;
+    fn eval_unary(&mut self, tok: &Token, expr: &Expr) -> Result<ValueCell> {
+        let value = self.eval_expr(expr)?;
+        let value = &*value.borrow();
         Ok(match tok.typ {
-            TT::Bang => Boolean(!self.eval_truthy(&expr)),
-            TT::Minus => match expr {
-                Num(num) => Num(-num),
+            TT::Bang => ValueCell::new(Boolean(!self.eval_truthy(value))),
+            TT::Minus => match value {
+                Num(num) => ValueCell::new(Num(-num)),
                 value => bail!(
                     "line {}: expected number, found: {}{}",
                     tok.line,
@@ -156,8 +163,8 @@ impl Interpreter {
         }
     }
 
-    fn eval_comparison(&mut self, lhs: &Value, tok: &Token, rhs: &Value) -> Result<Value> {
-        Ok(Boolean(match (lhs, tok.typ, rhs) {
+    fn eval_comparison(&mut self, lhs: &Value, tok: &Token, rhs: &Value) -> Result<ValueCell> {
+        Ok(ValueCell::new(Boolean(match (lhs, tok.typ, rhs) {
             (Num(lhs), TT::Less, Num(rhs)) => lhs < rhs,
             (Num(lhs), TT::LessEqual, Num(rhs)) => lhs <= rhs,
             (Num(lhs), TT::Greater, Num(rhs)) => lhs > rhs,
@@ -173,11 +180,11 @@ impl Interpreter {
                 tok.lexeme,
                 rhs
             ),
-        }))
+        })))
     }
 
-    fn eval_arithmetic(&mut self, lhs: &Value, tok: &Token, rhs: &Value) -> Result<Value> {
-        Ok(match (lhs, tok.typ, rhs) {
+    fn eval_arithmetic(&mut self, lhs: &Value, tok: &Token, rhs: &Value) -> Result<ValueCell> {
+        Ok(ValueCell::new(match (lhs, tok.typ, rhs) {
             (Num(lhs), TT::Plus, Num(rhs)) => Num(lhs + rhs),
             (Num(lhs), TT::Minus, Num(rhs)) => Num(lhs - rhs),
             (Num(lhs), TT::Star, Num(rhs)) => Num(lhs * rhs),
@@ -190,7 +197,7 @@ impl Interpreter {
                 tok.lexeme,
                 rhs
             ),
-        })
+        }))
     }
 
     fn eval_truthy(&mut self, value: &Value) -> bool {
@@ -398,6 +405,9 @@ mod tests {
     }
 
     fn eval_expr_str(string: &str) -> Result<Value> {
-        Interpreter::new().eval_expr(&Parser::new(Box::new(Lexer::from_str(string))).parse_expr()?)
+        Ok(Interpreter::new()
+            .eval_expr(&Parser::new(Box::new(Lexer::from_str(string))).parse_expr()?)?
+            .borrow()
+            .clone())
     }
 }
