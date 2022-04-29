@@ -28,6 +28,8 @@ lazy_static! {
     // lox language reserved words and associated token types
     static ref KEYWORD_TYPES: HashMap<&'static str, TokenType> = [
         ("and", TokenType::And),
+        ("break", TokenType::Break),
+        ("continue", TokenType::Continue),
         ("class", TokenType::Class),
         ("else", TokenType::Else),
         ("false", TokenType::False),

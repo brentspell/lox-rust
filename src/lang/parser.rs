@@ -26,6 +26,7 @@ at an arbitrary number of tokens ahead of the current position.
 */
 pub struct Parser {
     reader: LookaheadReader<Token>,
+    loops: u32,
 }
 
 impl Parser {
@@ -41,6 +42,7 @@ impl Parser {
     pub fn new(tokens: Box<dyn Iterator<Item = Result<Token>>>) -> Parser {
         Self {
             reader: LookaheadReader::new(tokens),
+            loops: 0,
         }
     }
 
@@ -175,6 +177,33 @@ impl Parser {
                 Stmt::Print(self.expression()?)
             }
 
+            // match control flow
+            Some(TokenType::Break) => {
+                let tok = self.read()?;
+                if self.loops == 0 {
+                    bail!("line {}: break invalid outside loop", tok.line);
+                }
+                Stmt::Break(false)
+            }
+            Some(TokenType::Continue) => {
+                let tok = self.read()?;
+                if self.loops == 0 {
+                    bail!("line {}: continue invalid outside loop", tok.line);
+                }
+                Stmt::Break(true)
+            }
+            Some(TokenType::If) => {
+                return self.if_();
+            }
+
+            Some(TokenType::While) => {
+                return self.while_();
+            }
+
+            Some(TokenType::For) => {
+                return self.for_();
+            }
+
             // match blocks
             Some(TokenType::LeftBrace) => {
                 return Ok(Stmt::Block(self.block()?));
@@ -191,6 +220,138 @@ impl Parser {
         }
 
         Ok(stmt)
+    }
+
+    fn if_(&mut self) -> Result<Stmt> {
+        self.read()?;
+
+        let paren = self.read()?;
+        if paren.typ != TokenType::LeftParen {
+            bail!(
+                "line {}: expected ( after if, found {}",
+                paren.line,
+                paren.lexeme
+            );
+        }
+
+        let cond = self.expression()?;
+
+        let paren = self.read()?;
+        if paren.typ != TokenType::RightParen {
+            bail!(
+                "line {}: expected ) after if, found {}",
+                paren.line,
+                paren.lexeme
+            );
+        }
+
+        let cons = self.statement()?;
+        if self.peek_type(0)? == Some(TokenType::Else) {
+            self.read()?;
+            let alt = self.statement()?;
+            Ok(Stmt::If(cond, Box::new(cons), Some(Box::new(alt))))
+        } else {
+            Ok(Stmt::If(cond, Box::new(cons), None))
+        }
+    }
+
+    fn while_(&mut self) -> Result<Stmt> {
+        self.read()?;
+
+        let paren = self.read()?;
+        if paren.typ != TokenType::LeftParen {
+            bail!(
+                "line {}: expected ( after while, found {}",
+                paren.line,
+                paren.lexeme
+            );
+        }
+
+        let cond = self.expression()?;
+
+        let paren = self.read()?;
+        if paren.typ != TokenType::RightParen {
+            bail!(
+                "line {}: expected ) after while, found {}",
+                paren.line,
+                paren.lexeme
+            );
+        }
+
+        self.loops += 1;
+        let body = self.statement();
+        self.loops -= 1;
+        let body = body?;
+
+        Ok(Stmt::While(cond, Box::new(body), None))
+    }
+
+    fn for_(&mut self) -> Result<Stmt> {
+        // eat the keyword
+        self.read()?;
+
+        // open paren
+        let paren = self.read()?;
+        if paren.typ != TokenType::LeftParen {
+            bail!(
+                "line {}: expected ( after for, found {}",
+                paren.line,
+                paren.lexeme
+            );
+        }
+
+        // optional initializer
+        let initializer = match self.peek_type(0)? {
+            Some(TokenType::Semicolon) => {
+                self.read()?;
+                None
+            }
+            Some(TokenType::Var) => self.declaration()?,
+            _ => Some(Stmt::Expr(self.expression()?)),
+        };
+
+        // optional condition, default to infinite loop
+        let cond = match self.peek_type(0)? {
+            Some(TokenType::Semicolon) => Expr::Literal(Value::Boolean(true)),
+            _ => self.expression()?,
+        };
+
+        let end = self.read()?;
+        if end.typ != TokenType::Semicolon {
+            bail!("line {}: expected ; in for, found {}", end.line, end.lexeme);
+        }
+
+        // optional increment
+        let increment = match self.peek_type(0)? {
+            Some(TokenType::RightParen) => None,
+            _ => Some(Box::new(Stmt::Expr(self.expression()?))),
+        };
+
+        // close paren
+        let paren = self.read()?;
+        if paren.typ != TokenType::RightParen {
+            bail!(
+                "line {}: expected ) after for, found {}",
+                paren.line,
+                paren.lexeme
+            );
+        }
+
+        // compose a block for the loop
+        self.loops += 1;
+        let block = self.statement();
+        self.loops -= 1;
+        let block = block?;
+
+        let block = Stmt::While(cond, Box::new(block), increment);
+
+        let block = if let Some(initializer) = initializer {
+            Stmt::Block(vec![initializer, block])
+        } else {
+            block
+        };
+
+        Ok(block)
     }
 
     fn block(&mut self) -> Result<Vec<Stmt>> {
@@ -214,7 +375,7 @@ impl Parser {
     }
 
     fn assignment(&mut self) -> Result<Expr> {
-        let lhs = self.equality()?;
+        let lhs = self.or()?;
         match self.peek_type(0)? {
             Some(TokenType::Equal) => {
                 self.read()?;
@@ -226,6 +387,22 @@ impl Parser {
             }
             _ => Ok(lhs),
         }
+    }
+
+    fn or(&mut self) -> Result<Expr> {
+        let mut expr = self.and()?;
+        while matches!(self.peek_type(0)?, Some(TokenType::Or)) {
+            expr = Expr::Logical(Box::new(expr), self.read()?, Box::new(self.and()?));
+        }
+        Ok(expr)
+    }
+
+    fn and(&mut self) -> Result<Expr> {
+        let mut expr = self.equality()?;
+        while matches!(self.peek_type(0)?, Some(TokenType::And)) {
+            expr = Expr::Logical(Box::new(expr), self.read()?, Box::new(self.equality()?));
+        }
+        Ok(expr)
     }
 
     fn equality(&mut self) -> Result<Expr> {
@@ -447,6 +624,29 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("unexpected end of input"));
+
+        assert!(parse("if true print true;")
+            .unwrap_err()
+            .to_string()
+            .contains("expected ( after if, found true"));
+        assert!(parse("if (true print true;")
+            .unwrap_err()
+            .to_string()
+            .contains("expected ) after if, found print"));
+
+        assert!(parse("while true print true;")
+            .unwrap_err()
+            .to_string()
+            .contains("expected ( after while, found true"));
+        assert!(parse("while (true print true;")
+            .unwrap_err()
+            .to_string()
+            .contains("expected ) after while, found print"));
+
+        assert!(parse("break;")
+            .unwrap_err()
+            .to_string()
+            .contains("break invalid outside loop"));
     }
 
     #[test]
@@ -690,6 +890,38 @@ mod tests {
     }
 
     #[test]
+    fn test_logical() {
+        assert!(roundtrip_expr("true or false"));
+        assert!(roundtrip_expr("true and false"));
+        assert!(roundtrip_expr("true and false or true"));
+
+        match parse_expr("true or false") {
+            Ok(Expr::Logical(value1, op, value2)) => {
+                assert_eq!(op.typ, TokenType::Or);
+                assert!(matches!(*value1, Expr::Literal(Value::Boolean(true))));
+                assert!(matches!(*value2, Expr::Literal(Value::Boolean(false))));
+            }
+            _ => panic!(),
+        }
+
+        match parse_expr("true and false or true") {
+            Ok(Expr::Logical(expr1, op2, value3)) => {
+                assert_eq!(op2.typ, TokenType::Or);
+                assert!(matches!(*value3, Expr::Literal(Value::Boolean(true))));
+                match *expr1 {
+                    Expr::Logical(value1, op1, value2) => {
+                        assert_eq!(op1.typ, TokenType::And);
+                        assert!(matches!(*value1, Expr::Literal(Value::Boolean(true))));
+                        assert!(matches!(*value2, Expr::Literal(Value::Boolean(false))));
+                    }
+                    _ => panic!(),
+                }
+            }
+            _ => panic!(),
+        }
+    }
+
+    #[test]
     fn test_assignment() {
         assert!(roundtrip_expr("x = 1"));
         assert!(roundtrip_expr("y = x + 1"));
@@ -835,6 +1067,175 @@ mod tests {
     }
 
     #[test]
+    fn test_if_stmt() {
+        assert!(roundtrip("if (x == 1) print true;"));
+        assert!(roundtrip("if (x == 1) {\nprint true;}\n"));
+        assert!(roundtrip("if (x == 1) print true; else print false;"));
+        assert!(roundtrip(
+            "if (x == 1) {\nprint true;}\n else {\nprint false;}\n"
+        ));
+
+        match parse("if (true) print true;").unwrap().stmts.pop().unwrap() {
+            Stmt::If(cond, cons, None) => {
+                match cond {
+                    Expr::Literal(value) => assert_eq!(value, Value::Boolean(true)),
+                    _ => panic!(),
+                }
+                match *cons {
+                    Stmt::Print(Expr::Literal(value)) => assert_eq!(value, Value::Boolean(true)),
+                    _ => panic!(),
+                }
+            }
+            _ => panic!(),
+        }
+
+        match parse("if (true) print true; else print false;")
+            .unwrap()
+            .stmts
+            .pop()
+            .unwrap()
+        {
+            Stmt::If(cond, cons, Some(alt)) => {
+                match cond {
+                    Expr::Literal(value) => assert_eq!(value, Value::Boolean(true)),
+                    _ => panic!(),
+                }
+                match *cons {
+                    Stmt::Print(Expr::Literal(value)) => assert_eq!(value, Value::Boolean(true)),
+                    _ => panic!(),
+                }
+                match *alt {
+                    Stmt::Print(Expr::Literal(value)) => assert_eq!(value, Value::Boolean(false)),
+                    _ => panic!(),
+                }
+            }
+            _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn test_while_stmt() {
+        assert!(roundtrip("while (x == 1) print true;"));
+
+        match parse("while (true) print true;")
+            .unwrap()
+            .stmts
+            .pop()
+            .unwrap()
+        {
+            Stmt::While(cond, body, None) => {
+                match cond {
+                    Expr::Literal(value) => assert_eq!(value, Value::Boolean(true)),
+                    _ => panic!(),
+                }
+                match *body {
+                    Stmt::Print(Expr::Literal(value)) => assert_eq!(value, Value::Boolean(true)),
+                    _ => panic!(),
+                }
+            }
+            _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn test_for_stmt() {
+        match parse("for (;;) print true;").unwrap().stmts.pop().unwrap() {
+            Stmt::While(cond, body, None) => {
+                match cond {
+                    Expr::Literal(value) => assert_eq!(value, Value::Boolean(true)),
+                    _ => panic!(),
+                }
+                match *body {
+                    Stmt::Print(Expr::Literal(value)) => assert_eq!(value, Value::Boolean(true)),
+                    _ => panic!(),
+                }
+            }
+            _ => panic!(),
+        }
+
+        match parse("for (var x = 1;;) print true;")
+            .unwrap()
+            .stmts
+            .pop()
+            .unwrap()
+        {
+            Stmt::Block(stmts) => {
+                match &stmts[0] {
+                    Stmt::Decl(tok, expr) => {
+                        assert_eq!(tok.lexeme, "x");
+                        match expr {
+                            Expr::Literal(value) => assert_eq!(*value, Value::Num(1.0)),
+                            _ => panic!(),
+                        }
+                    }
+                    _ => panic!(),
+                }
+                match &stmts[1] {
+                    Stmt::While(cond, body, None) => {
+                        match cond {
+                            Expr::Literal(value) => assert_eq!(*value, Value::Boolean(true)),
+                            _ => panic!(),
+                        }
+                        match &**body {
+                            Stmt::Print(Expr::Literal(value)) => {
+                                assert_eq!(*value, Value::Boolean(true))
+                            }
+                            _ => panic!(),
+                        }
+                    }
+                    _ => panic!(),
+                }
+            }
+            _ => panic!(),
+        }
+
+        match parse("for (; false;) print true;")
+            .unwrap()
+            .stmts
+            .pop()
+            .unwrap()
+        {
+            Stmt::While(cond, body, None) => {
+                match cond {
+                    Expr::Literal(value) => assert_eq!(value, Value::Boolean(false)),
+                    _ => panic!(),
+                }
+                match *body {
+                    Stmt::Print(Expr::Literal(value)) => assert_eq!(value, Value::Boolean(true)),
+                    _ => panic!(),
+                }
+            }
+            _ => panic!(),
+        }
+
+        match parse("for (; ; x = 1) print true;")
+            .unwrap()
+            .stmts
+            .pop()
+            .unwrap()
+        {
+            Stmt::While(cond, body, Some(increment)) => {
+                match cond {
+                    Expr::Literal(value) => assert_eq!(value, Value::Boolean(true)),
+                    _ => panic!(),
+                }
+                match *body {
+                    Stmt::Print(Expr::Literal(value)) => assert_eq!(value, Value::Boolean(true)),
+                    _ => panic!(),
+                }
+                match *increment {
+                    Stmt::Expr(Expr::Assignment(var, expr)) => {
+                        assert_eq!(var.lexeme, "x");
+                        assert!(matches!(*expr, Expr::Literal(Value::Num(x)) if x == 1.0));
+                    }
+                    _ => panic!(),
+                }
+            }
+            _ => panic!(),
+        }
+    }
+
+    #[test]
     fn test_stmt_block() {
         assert!(roundtrip("{\n}\n"));
         assert!(roundtrip("{\nvar x = 1;}\n"));
@@ -866,6 +1267,12 @@ mod tests {
             }
             _ => panic!(),
         }
+    }
+
+    #[test]
+    fn test_break_continue() {
+        assert!(roundtrip("while (x == 1) break;"));
+        assert!(roundtrip("while (x == 1) continue;"));
     }
 
     fn parse(string: &str) -> Result<Program> {

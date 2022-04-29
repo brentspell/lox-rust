@@ -30,9 +30,12 @@ impl fmt::Display for Program {
 #[derive(Debug)]
 pub enum Stmt {
     Block(Vec<Stmt>),
+    Break(bool),
     Decl(Token, Expr),
     Expr(Expr),
+    If(Expr, Box<Stmt>, Option<Box<Stmt>>),
     Print(Expr),
+    While(Expr, Box<Stmt>, Option<Box<Stmt>>),
 }
 
 impl fmt::Display for Stmt {
@@ -49,6 +52,7 @@ impl fmt::Display for Stmt {
                 writeln!(f, "}}")?;
                 Ok(())
             }
+            Self::Break(cont) => write!(f, "{};", if *cont { "continue" } else { "break" }),
             Self::Decl(tok, expr) => {
                 if let Expr::Literal(Value::Nil) = expr {
                     write!(f, "var {};", tok.lexeme)
@@ -57,7 +61,11 @@ impl fmt::Display for Stmt {
                 }
             }
             Self::Expr(expr) => write!(f, "{};", expr),
+            Self::If(cond, cons, None) => write!(f, "if ({}) {}", cond, cons),
+            Self::If(cond, cons, Some(alt)) => write!(f, "if ({}) {} else {}", cond, cons, alt),
             Self::Print(expr) => write!(f, "print {};", expr),
+            Self::While(cond, body, None) => write!(f, "while ({}) {}", cond, body),
+            Self::While(cond, body, Some(post)) => write!(f, "while ({}) {} {}", cond, body, post),
         }
     }
 }
@@ -71,6 +79,7 @@ pub enum Expr {
     Binary(Box<Expr>, Token, Box<Expr>),
     Grouping(Box<Expr>),
     Literal(Value),
+    Logical(Box<Expr>, Token, Box<Expr>),
     Unary(Token, Box<Expr>),
     Variable(Token),
 }
@@ -82,6 +91,7 @@ impl fmt::Display for Expr {
             Self::Binary(lhs, op, rhs) => write!(f, "{} {} {}", lhs, op.lexeme, rhs),
             Self::Grouping(expr) => write!(f, "({})", expr),
             Self::Literal(value) => write!(f, "{}", value),
+            Self::Logical(lhs, op, rhs) => write!(f, "{} {} {}", lhs, op.lexeme, rhs),
             Self::Unary(op, expr) => write!(f, "{}{}", op.lexeme, expr),
             Self::Variable(var) => write!(f, "{}", var.lexeme),
         }
@@ -114,6 +124,8 @@ These are the supported token types returned by the Lox lexer.
 */
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub enum TokenType {
+    Break,
+    Continue,
     LeftParen,
     RightParen,
     LeftBrace,
