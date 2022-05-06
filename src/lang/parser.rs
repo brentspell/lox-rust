@@ -130,43 +130,104 @@ impl Parser {
     }
 
     fn declaration(&mut self) -> Result<Option<Stmt>> {
-        match self.peek_type(0)? {
-            None => Ok(None),
-            Some(TokenType::Var) => {
-                self.read()?;
+        Ok(match self.peek_type(0)? {
+            None => None,
+            Some(TokenType::Var) => Some(self.var_decl()?),
+            Some(TokenType::Fun) => Some(self.fun_decl()?),
+            _ => Some(self.statement()?),
+        })
+    }
 
-                // match the variable name
-                let var = self.read()?;
-                if var.typ != TokenType::Identifier {
-                    bail!(
-                        "line {}: expected identifier, found {}",
-                        var.line,
-                        var.lexeme
-                    );
-                }
+    fn var_decl(&mut self) -> Result<Stmt> {
+        self.read()?;
 
-                // match the optional variable value
-                let val = if self.peek_type(0)? == Some(TokenType::Equal) {
-                    self.read()?;
-                    self.expression()?
-                } else {
-                    Expr::Literal(Value::Nil)
-                };
-
-                // match the statement terminator
-                let end = self.read()?;
-                if end.typ != TokenType::Semicolon {
-                    bail!(
-                        "line {}: expected ; or expression, found {}",
-                        end.line,
-                        end.lexeme
-                    );
-                }
-                Ok(Some(Stmt::Decl(var, val)))
-            }
-
-            _ => Ok(Some(self.statement()?)),
+        // match the variable name
+        let var = self.read()?;
+        if var.typ != TokenType::Identifier {
+            bail!(
+                "line {}: expected identifier, found {}",
+                var.line,
+                var.lexeme
+            );
         }
+
+        // match the optional variable value
+        let val = if self.peek_type(0)? == Some(TokenType::Equal) {
+            self.read()?;
+            self.expression()?
+        } else {
+            Expr::Literal(Value::Nil)
+        };
+
+        // match the statement terminator
+        let end = self.read()?;
+        if end.typ != TokenType::Semicolon {
+            bail!(
+                "line {}: expected ; or expression, found {}",
+                end.line,
+                end.lexeme
+            );
+        }
+        Ok(Stmt::Var(var, val))
+    }
+
+    fn fun_decl(&mut self) -> Result<Stmt> {
+        self.read()?;
+
+        // match the function name
+        let name = self.read()?;
+        if name.typ != TokenType::Identifier {
+            bail!(
+                "line {}: expected identifier, found {}",
+                name.line,
+                name.lexeme
+            );
+        }
+
+        // match the left paren
+        let lp = self.read()?;
+        if lp.typ != TokenType::LeftParen {
+            bail!("line {}: expected ( found {}", lp.line, lp.lexeme);
+        }
+
+        // parse the (maybe empty) parameter list
+        let mut params = Vec::new();
+        if self.peek_type(0)? != Some(TokenType::RightParen) {
+            loop {
+                let param = self.read()?;
+                if param.typ != TokenType::Identifier {
+                    bail!(
+                        "line {}: expected identifier found {}",
+                        param.line,
+                        param.lexeme
+                    );
+                }
+                params.push(param);
+
+                // continue parsing args if we have commas
+                if self.peek_type(0)? != Some(TokenType::Comma) {
+                    break;
+                }
+                self.read()?;
+            }
+        }
+
+        // match the right paren
+        let rp = self.read()?;
+        if rp.typ != TokenType::RightParen {
+            bail!("line {}: expected ) found {}", rp.line, rp.lexeme);
+        }
+
+        // parse the function body
+        let body = match self.peek(0)? {
+            None => bail!("unexpected end of input"),
+            Some(tok) if tok.typ != TokenType::LeftBrace => {
+                bail!("line {}: expected {{ found {}", tok.line, tok.lexeme)
+            }
+            Some(_) => Stmt::Block(self.block()?),
+        };
+
+        Ok(Stmt::Fun(name, params, Box::new(body)))
     }
 
     fn statement(&mut self) -> Result<Stmt> {
@@ -441,8 +502,43 @@ impl Parser {
         if matches!(self.peek_type(0)?, Some(typ) if typ.is_unary()) {
             Ok(Expr::Unary(self.read()?, Box::new(self.unary()?)))
         } else {
-            self.primary()
+            self.call()
         }
+    }
+
+    fn call(&mut self) -> Result<Expr> {
+        let mut expr = self.primary()?;
+
+        // parse an arbitrary sequence of calls into a tree, as long as we have left parens
+        // if this is not a call, simply return the primary expression parsed above
+        while self.peek_type(0)? == Some(TokenType::LeftParen) {
+            let lp = self.read()?;
+
+            // parse the (maybe empty) argument list
+            let mut args = Vec::new();
+            if self.peek_type(0)? != Some(TokenType::RightParen) {
+                loop {
+                    args.push(self.expression()?);
+
+                    // continue parsing args if we have commas
+                    if self.peek_type(0)? != Some(TokenType::Comma) {
+                        break;
+                    }
+                    self.read()?;
+                }
+            }
+
+            // calls must end with )
+            let rp = self.read()?;
+            if rp.typ != TokenType::RightParen {
+                bail!("line {}: expected ) after (, found {}", rp.line, rp.lexeme);
+            }
+
+            // construct the current leg of the call tree for the sequence
+            expr = Expr::Call(Box::new(expr), lp, args);
+        }
+
+        Ok(expr)
     }
 
     fn primary(&mut self) -> Result<Expr> {
@@ -608,6 +704,32 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("unexpected end of input"));
+
+        assert!(parse("fun 1() {}")
+            .unwrap_err()
+            .to_string()
+            .contains("expected identifier"));
+        assert!(parse("fun test {}")
+            .unwrap_err()
+            .to_string()
+            .contains("expected ("));
+        assert!(parse("fun test(1) {}")
+            .unwrap_err()
+            .to_string()
+            .contains("expected identifier"));
+        assert!(parse("fun test(x;")
+            .unwrap_err()
+            .to_string()
+            .contains("expected )"));
+        assert!(parse("fun test()")
+            .unwrap_err()
+            .to_string()
+            .contains("unexpected end of input"));
+        assert!(parse("fun test() x {}")
+            .unwrap_err()
+            .to_string()
+            .contains("expected {"));
+
         assert!(parse("print 42")
             .unwrap_err()
             .to_string()
@@ -680,6 +802,11 @@ mod tests {
             .to_string()
             .contains("invalid assignment target"));
 
+        assert!(parse_expr("test(1;")
+            .unwrap_err()
+            .to_string()
+            .contains("expected ) after ("));
+
         assert_eq!(
             parse_expr("")
                 .unwrap_err()
@@ -730,6 +857,37 @@ mod tests {
             parse_expr("x"),
             Ok(Expr::Variable(tok)) if tok.lexeme == "x"
         ));
+    }
+
+    #[test]
+    fn test_call() {
+        assert!(roundtrip_expr("test()"));
+        assert!(roundtrip_expr("test(1)"));
+        assert!(roundtrip_expr("test(1, 2)"));
+        assert!(roundtrip_expr("test(x + 1)"));
+        assert!(roundtrip_expr("test()()()"));
+        assert!(roundtrip_expr("test(test1(test2()))"));
+
+        match parse_expr("test()") {
+            Ok(Expr::Call(callee, paren, args)) => {
+                match *callee {
+                    Expr::Variable(tok) => assert_eq!(tok.lexeme, "test"),
+                    _ => panic!(),
+                }
+                assert_eq!(paren.typ, TokenType::LeftParen);
+                assert!(args.is_empty());
+            }
+            _ => panic!(),
+        }
+
+        match parse_expr("test(1, 2)") {
+            Ok(Expr::Call(callee, paren, args)) => {
+                assert_eq!(args.len(), 2);
+                assert!(matches!(args[0], Expr::Literal(Value::Num(x)) if x == 1.0));
+                assert!(matches!(args[1], Expr::Literal(Value::Num(x)) if x == 2.0));
+            }
+            _ => panic!(),
+        }
     }
 
     #[test]
@@ -1011,12 +1169,12 @@ mod tests {
     }
 
     #[test]
-    fn test_decl_stmt() {
+    fn test_var_decl_stmt() {
         assert!(roundtrip("var x;"));
         assert!(roundtrip("var y = 42;"));
 
         match &parse("var x;").unwrap().stmts[0] {
-            Stmt::Decl(tok, expr) => {
+            Stmt::Var(tok, expr) => {
                 assert_eq!(tok.typ, TokenType::Identifier);
                 assert_eq!(tok.lexeme, "x");
                 match expr {
@@ -1028,13 +1186,34 @@ mod tests {
         }
 
         match &parse("var y = 42;").unwrap().stmts[0] {
-            Stmt::Decl(tok, expr) => {
+            Stmt::Var(tok, expr) => {
                 assert_eq!(tok.typ, TokenType::Identifier);
                 assert_eq!(tok.lexeme, "y");
                 match expr {
                     Expr::Literal(value) => assert_eq!(*value, Value::Num(42.0)),
                     _ => panic!(),
                 }
+            }
+            _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn test_fun_decl_stmt() {
+        assert!(roundtrip("fun test() {\n}\n"));
+        assert!(roundtrip("fun test(a, b) {\nprint a;\nprint b;\n}\n"));
+
+        match &parse("fun test(a, b) {\nprint a;\nprint b;\n}\n")
+            .unwrap()
+            .stmts[0]
+        {
+            Stmt::Fun(name, params, body) => {
+                assert_eq!(name.typ, TokenType::Identifier);
+                assert_eq!(name.lexeme, "test");
+                assert_eq!(params[0].typ, TokenType::Identifier);
+                assert_eq!(params[0].lexeme, "a");
+                assert_eq!(params[1].typ, TokenType::Identifier);
+                assert_eq!(params[1].lexeme, "b");
             }
             _ => panic!(),
         }
@@ -1069,10 +1248,10 @@ mod tests {
     #[test]
     fn test_if_stmt() {
         assert!(roundtrip("if (x == 1) print true;"));
-        assert!(roundtrip("if (x == 1) {\nprint true;}\n"));
+        assert!(roundtrip("if (x == 1) {\nprint true;\n}\n"));
         assert!(roundtrip("if (x == 1) print true; else print false;"));
         assert!(roundtrip(
-            "if (x == 1) {\nprint true;}\n else {\nprint false;}\n"
+            "if (x == 1) {\nprint true;\n}\n else {\nprint false;\n}\n"
         ));
 
         match parse("if (true) print true;").unwrap().stmts.pop().unwrap() {
@@ -1161,7 +1340,7 @@ mod tests {
         {
             Stmt::Block(stmts) => {
                 match &stmts[0] {
-                    Stmt::Decl(tok, expr) => {
+                    Stmt::Var(tok, expr) => {
                         assert_eq!(tok.lexeme, "x");
                         match expr {
                             Expr::Literal(value) => assert_eq!(*value, Value::Num(1.0)),
@@ -1238,12 +1417,12 @@ mod tests {
     #[test]
     fn test_stmt_block() {
         assert!(roundtrip("{\n}\n"));
-        assert!(roundtrip("{\nvar x = 1;}\n"));
+        assert!(roundtrip("{\nvar x = 1;\n}\n"));
 
         match &parse("{ var x = 1; var y = 2; }").unwrap().stmts[0] {
             Stmt::Block(stmts) => {
                 match &stmts[0] {
-                    Stmt::Decl(tok, expr) => {
+                    Stmt::Var(tok, expr) => {
                         assert_eq!(tok.typ, TokenType::Identifier);
                         assert_eq!(tok.lexeme, "x");
                         match expr {
@@ -1254,7 +1433,7 @@ mod tests {
                     _ => panic!(),
                 }
                 match &stmts[1] {
-                    Stmt::Decl(tok, expr) => {
+                    Stmt::Var(tok, expr) => {
                         assert_eq!(tok.typ, TokenType::Identifier);
                         assert_eq!(tok.lexeme, "y");
                         match expr {

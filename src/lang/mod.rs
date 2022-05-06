@@ -2,6 +2,7 @@
 # Lox language data model and helpers.
 */
 
+use std::cell::RefCell;
 use std::fmt;
 
 mod env;
@@ -27,15 +28,16 @@ impl fmt::Display for Program {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum Stmt {
     Block(Vec<Stmt>),
     Break(bool),
-    Decl(Token, Expr),
+    Var(Token, Expr),
     Expr(Expr),
     If(Expr, Box<Stmt>, Option<Box<Stmt>>),
     Print(Expr),
     While(Expr, Box<Stmt>, Option<Box<Stmt>>),
+    Fun(Token, Vec<Token>, Box<Stmt>),
 }
 
 impl fmt::Display for Stmt {
@@ -44,16 +46,13 @@ impl fmt::Display for Stmt {
             Self::Block(stmts) => {
                 writeln!(f, "{{")?;
                 for (i, e) in stmts.iter().enumerate() {
-                    if i > 0 {
-                        writeln!(f)?;
-                    }
-                    e.fmt(f)?;
+                    writeln!(f, "{}", e)?;
                 }
                 writeln!(f, "}}")?;
                 Ok(())
             }
             Self::Break(cont) => write!(f, "{};", if *cont { "continue" } else { "break" }),
-            Self::Decl(tok, expr) => {
+            Self::Var(tok, expr) => {
                 if let Expr::Literal(Value::Nil) = expr {
                     write!(f, "var {};", tok.lexeme)
                 } else {
@@ -66,6 +65,17 @@ impl fmt::Display for Stmt {
             Self::Print(expr) => write!(f, "print {};", expr),
             Self::While(cond, body, None) => write!(f, "while ({}) {}", cond, body),
             Self::While(cond, body, Some(post)) => write!(f, "while ({}) {} {}", cond, body, post),
+            Self::Fun(name, params, body) => {
+                write!(f, "fun {}(", name.lexeme)?;
+                for (i, e) in params.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, ", ")?;
+                    }
+                    e.lexeme.fmt(f)?;
+                }
+                write!(f, ") {}", body)?;
+                Ok(())
+            }
         }
     }
 }
@@ -73,10 +83,11 @@ impl fmt::Display for Stmt {
 /**
 This enumeration represents an Abstract Syntax Tree (AST) for an expression in Lox.
 */
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum Expr {
     Assignment(Token, Box<Expr>),
     Binary(Box<Expr>, Token, Box<Expr>),
+    Call(Box<Expr>, Token, Vec<Expr>),
     Grouping(Box<Expr>),
     Literal(Value),
     Logical(Box<Expr>, Token, Box<Expr>),
@@ -89,6 +100,17 @@ impl fmt::Display for Expr {
         match self {
             Self::Assignment(var, expr) => write!(f, "{} = {}", var.lexeme, expr),
             Self::Binary(lhs, op, rhs) => write!(f, "{} {} {}", lhs, op.lexeme, rhs),
+            Self::Call(callee, _paren, args) => {
+                write!(f, "{}(", callee)?;
+                for (i, e) in args.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, ", ")?;
+                    }
+                    e.fmt(f)?;
+                }
+                write!(f, ")")?;
+                Ok(())
+            }
             Self::Grouping(expr) => write!(f, "({})", expr),
             Self::Literal(value) => write!(f, "{}", value),
             Self::Logical(lhs, op, rhs) => write!(f, "{} {} {}", lhs, op.lexeme, rhs),
@@ -101,7 +123,7 @@ impl fmt::Display for Expr {
 /**
 The token structure is the lexical unit in the Lox language.
 */
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Token {
     pub typ: TokenType,
     pub line: u32,
@@ -207,12 +229,25 @@ impl fmt::Display for TokenType {
 /**
 This structure represents a literal/primitive value in the Lox language.
 */
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
 pub enum Value {
     Nil,
     Boolean(bool),
     Num(f64),
     Str(String),
+    Fun(RefCell<Box<Stmt>>),
+}
+
+impl PartialEq for Value {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Nil, Self::Nil) => true,
+            (Self::Boolean(v1), Self::Boolean(v2)) => v1 == v2,
+            (Self::Num(v1), Self::Num(v2)) => v1 == v2,
+            (Self::Str(v1), Self::Str(v2)) => v1 == v2,
+            _ => false,
+        }
+    }
 }
 
 impl fmt::Display for Value {
@@ -228,6 +263,10 @@ impl fmt::Display for Value {
                 }
             }
             Value::Str(value) => format!("\"{value}\""),
+            Value::Fun(stmt) => match &**stmt.borrow() {
+                Stmt::Fun(name, _, _) => format!("<function {}>", name.lexeme),
+                _ => panic!("invalid function value"),
+            },
         })
     }
 }

@@ -84,10 +84,14 @@ impl Interpreter {
                 self.breaking = Some(*cont);
                 "".to_string()
             }
-            Stmt::Decl(tok, expr) => {
+            Stmt::Var(tok, expr) => {
                 // define a new variable in the current environment
                 let value = self.eval_expr(expr)?;
                 self.env.define(&tok.lexeme, value);
+                "".to_string()
+            }
+            Stmt::Fun(name, params, body) => {
+                // TODO: implement
                 "".to_string()
             }
             Stmt::Expr(expr) => {
@@ -155,6 +159,7 @@ impl Interpreter {
         Ok(match expr {
             Expr::Assignment(var, expr) => self.eval_assign(var, expr)?,
             Expr::Binary(lhs, tok, rhs) => self.eval_binary(lhs, tok, rhs)?,
+            Expr::Call(callee, tok, args) => self.eval_call(callee, tok, args)?,
             Expr::Grouping(expr) => self.eval_expr(expr)?,
             Expr::Literal(value) => ValueCell::new(value.clone()),
             Expr::Logical(lhs, tok, rhs) => self.eval_logical(lhs, tok, rhs)?,
@@ -259,6 +264,11 @@ impl Interpreter {
                 rhs
             ),
         }))
+    }
+
+    fn eval_call(&mut self, callee: &Expr, tok: &Token, args: &Vec<Expr>) -> Result<ValueCell> {
+        // TODO: implement
+        Ok(ValueCell::new(Value::Nil))
     }
 
     fn eval_truthy(&mut self, value: &Value) -> bool {
