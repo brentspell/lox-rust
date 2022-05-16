@@ -75,8 +75,8 @@ impl Interpreter {
         match stmt {
             Stmt::Block(stmts) => self.eval_block(stmts),
             Stmt::Break(cont) => self.eval_break(*cont),
-            Stmt::Var(tok, expr) => self.eval_var(tok, expr),
-            Stmt::Fun(name, _params, _body) => self.eval_fun(name, stmt),
+            Stmt::Var(_tok, qname, expr) => self.eval_var(qname, expr),
+            Stmt::Fun(_tok, qname, _params, _body) => self.eval_fun(qname, stmt),
             Stmt::Expr(expr) => self.eval_expr(expr).map(|_| ()),
             Stmt::If(cond, cons, alt) => self.eval_if(cond, cons, alt),
             Stmt::Print(expr) => self.eval_print(expr),
@@ -97,15 +97,15 @@ impl Interpreter {
         Ok(())
     }
 
-    fn eval_var(&mut self, tok: &Token, expr: &Expr) -> Result<()> {
+    fn eval_var(&mut self, qname: &str, expr: &Expr) -> Result<()> {
         let value = self.eval_expr(expr)?;
-        self.env.lock().unwrap().define(&tok.lexeme, value);
+        self.env.lock().unwrap().define(qname, value);
         Ok(())
     }
 
-    fn eval_fun(&mut self, name: &Token, stmt: &Stmt) -> Result<()> {
+    fn eval_fun(&mut self, qname: &str, stmt: &Stmt) -> Result<()> {
         let value = Value::Fun(Box::new(stmt.clone()), self.env.clone());
-        self.env.lock().unwrap().define(&name.lexeme, value);
+        self.env.lock().unwrap().define(qname, value);
         Ok(())
     }
 
@@ -171,20 +171,20 @@ impl Interpreter {
     */
     pub fn eval_expr(&mut self, expr: &Expr) -> Result<Value> {
         Ok(match expr {
-            Expr::Assignment(var, expr) => self.eval_assign(var, expr)?,
+            Expr::Assignment(var, qname, expr) => self.eval_assign(var, qname, expr)?,
             Expr::Binary(lhs, tok, rhs) => self.eval_binary(lhs, tok, rhs)?,
             Expr::Call(callee, tok, args) => self.eval_call(callee, tok, args)?,
             Expr::Grouping(expr) => self.eval_expr(expr)?,
             Expr::Literal(value) => value.clone(),
             Expr::Logical(lhs, tok, rhs) => self.eval_logical(lhs, tok, rhs)?,
             Expr::Unary(tok, expr) => self.eval_unary(tok, expr)?,
-            Expr::Variable(tok) => self.env.lock().unwrap().get(tok)?,
+            Expr::Variable(tok, qname) => self.env.lock().unwrap().get(tok, qname)?,
         })
     }
 
-    fn eval_assign(&mut self, var: &Token, expr: &Expr) -> Result<Value> {
+    fn eval_assign(&mut self, var: &Token, qname: &str, expr: &Expr) -> Result<Value> {
         let value = self.eval_expr(expr)?;
-        self.env.lock().unwrap().assign(var, value.clone())?;
+        self.env.lock().unwrap().assign(var, qname, value.clone())?;
         Ok(value)
     }
 
@@ -283,19 +283,19 @@ impl Interpreter {
             Value::Fun(stmt, env) => {
                 let env = Env::push(&env);
                 match *stmt {
-                    Stmt::Fun(name, params, body) => {
+                    Stmt::Fun(funtok, _qname, params, body) => {
                         if args.len() != params.len() {
                             bail!(
                                 "line {}: in call to {}, expected {} arguments, found {}",
                                 tok.line,
-                                name.lexeme,
+                                funtok.lexeme,
                                 params.len(),
                                 args.len()
                             );
                         }
 
                         for (p, a) in params.iter().zip(args.iter()) {
-                            env.lock().unwrap().define(&p.lexeme, self.eval_expr(a)?);
+                            env.lock().unwrap().define(p, self.eval_expr(a)?);
                         }
 
                         let env = std::mem::replace(&mut self.env, env);

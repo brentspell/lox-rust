@@ -10,6 +10,7 @@ pub mod interp;
 pub mod lexer;
 pub mod parser;
 mod reader;
+mod scope;
 
 #[derive(Debug, Clone)]
 pub struct Program {
@@ -32,12 +33,12 @@ impl fmt::Display for Program {
 pub enum Stmt {
     Block(Vec<Stmt>),
     Break(bool),
-    Var(Token, Expr),
+    Var(Token, String, Expr),
     Expr(Expr),
     If(Expr, Box<Stmt>, Option<Box<Stmt>>),
     Print(Expr),
     While(Expr, Box<Stmt>, Option<Box<Stmt>>),
-    Fun(Token, Vec<Token>, Box<Stmt>),
+    Fun(Token, String, Vec<String>, Box<Stmt>),
     Return(Token, Expr),
 }
 
@@ -53,7 +54,7 @@ impl fmt::Display for Stmt {
                 Ok(())
             }
             Self::Break(cont) => write!(f, "{};", if *cont { "continue" } else { "break" }),
-            Self::Var(tok, expr) => {
+            Self::Var(tok, _name, expr) => {
                 if let Expr::Literal(Value::Nil) = expr {
                     write!(f, "var {};", tok.lexeme)
                 } else {
@@ -66,13 +67,13 @@ impl fmt::Display for Stmt {
             Self::Print(expr) => write!(f, "print {};", expr),
             Self::While(cond, body, None) => write!(f, "while ({}) {}", cond, body),
             Self::While(cond, body, Some(post)) => write!(f, "while ({}) {} {}", cond, body, post),
-            Self::Fun(tok, params, body) => {
+            Self::Fun(tok, _name, params, body) => {
                 write!(f, "fun {}(", tok.lexeme)?;
-                for (i, e) in params.iter().enumerate() {
+                for (i, p) in params.iter().enumerate() {
                     if i > 0 {
                         write!(f, ", ")?;
                     }
-                    e.lexeme.fmt(f)?;
+                    p.split("::").last().unwrap().fmt(f)?;
                 }
                 write!(f, ") {}", body)?;
                 Ok(())
@@ -87,20 +88,20 @@ This enumeration represents an Abstract Syntax Tree (AST) for an expression in L
 */
 #[derive(Debug, Clone)]
 pub enum Expr {
-    Assignment(Token, Box<Expr>),
+    Assignment(Token, String, Box<Expr>),
     Binary(Box<Expr>, Token, Box<Expr>),
     Call(Box<Expr>, Token, Vec<Expr>),
     Grouping(Box<Expr>),
     Literal(Value),
     Logical(Box<Expr>, Token, Box<Expr>),
     Unary(Token, Box<Expr>),
-    Variable(Token),
+    Variable(Token, String),
 }
 
 impl fmt::Display for Expr {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self {
-            Self::Assignment(var, expr) => write!(f, "{} = {}", var.lexeme, expr),
+            Self::Assignment(tok, _qname, expr) => write!(f, "{} = {}", tok.lexeme, expr),
             Self::Binary(lhs, op, rhs) => write!(f, "{} {} {}", lhs, op.lexeme, rhs),
             Self::Call(callee, _paren, args) => {
                 write!(f, "{}(", callee)?;
@@ -117,7 +118,7 @@ impl fmt::Display for Expr {
             Self::Literal(value) => write!(f, "{}", value),
             Self::Logical(lhs, op, rhs) => write!(f, "{} {} {}", lhs, op.lexeme, rhs),
             Self::Unary(op, expr) => write!(f, "{}{}", op.lexeme, expr),
-            Self::Variable(var) => write!(f, "{}", var.lexeme),
+            Self::Variable(tok, _qname) => write!(f, "{}", tok.lexeme),
         }
     }
 }
@@ -266,7 +267,7 @@ impl fmt::Display for Value {
             }
             Value::Str(value) => format!("\"{value}\""),
             Value::Fun(stmt, _env) => match &**stmt {
-                Stmt::Fun(name, _, _) => format!("<function {}>", name.lexeme),
+                Stmt::Fun(tok, _, _, _) => format!("<function {}>", tok.lexeme),
                 _ => panic!("invalid function value"),
             },
         })

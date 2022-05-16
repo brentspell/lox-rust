@@ -13,10 +13,12 @@ dbg!(expr);
 */
 
 use std::fmt;
+use std::rc::Rc;
 
 use anyhow::{anyhow, bail, Error, Result};
 
 use crate::lang::reader::LookaheadReader;
+use crate::lang::scope::Scope;
 use crate::lang::{Expr, Program, Stmt, Token, TokenType, Value};
 
 /**
@@ -26,6 +28,7 @@ at an arbitrary number of tokens ahead of the current position.
 */
 pub struct Parser {
     reader: LookaheadReader<Token>,
+    scope: Rc<Scope>,
     loops: u32,
     funs: u32,
 }
@@ -43,6 +46,7 @@ impl Parser {
     pub fn new(tokens: impl Iterator<Item = Result<Token>> + 'static) -> Parser {
         Self {
             reader: LookaheadReader::new(tokens),
+            scope: Rc::new(Scope::default()),
             loops: 0,
             funs: 0,
         }
@@ -170,22 +174,41 @@ impl Parser {
                 end.lexeme
             );
         }
-        Ok(Stmt::Var(var, val))
+
+        // define the variable name in scope
+        let qname = Rc::get_mut(&mut self.scope).unwrap().define(&var.lexeme);
+
+        Ok(Stmt::Var(var, qname, val))
     }
 
     fn fun_decl(&mut self) -> Result<Stmt> {
         self.read()?;
 
         // match the function name
-        let name = self.read()?;
-        if name.typ != TokenType::Identifier {
+        let tok = self.read()?;
+        if tok.typ != TokenType::Identifier {
             bail!(
                 "line {}: expected identifier, found {}",
-                name.line,
-                name.lexeme
+                tok.line,
+                tok.lexeme
             );
         }
 
+        // define the function name in scope
+        let qname = Rc::get_mut(&mut self.scope).unwrap().define(&tok.lexeme);
+
+        // parse the parameter list and function body
+        self.funs += 1;
+        self.scope = Scope::push(&self.scope, &tok.lexeme);
+        let params = self.fun_params();
+        let body = self.fun_body();
+        self.scope = Scope::pop(&self.scope).unwrap();
+        self.funs -= 1;
+
+        Ok(Stmt::Fun(tok, qname, params?, Box::new(body?)))
+    }
+
+    fn fun_params(&mut self) -> Result<Vec<String>> {
         // match the left paren
         let lp = self.read()?;
         if lp.typ != TokenType::LeftParen {
@@ -204,7 +227,8 @@ impl Parser {
                         param.lexeme
                     );
                 }
-                params.push(param);
+                Rc::get_mut(&mut self.scope).unwrap().define(&param.lexeme);
+                params.push(self.scope.resolve(&param.lexeme));
 
                 // continue parsing args if we have commas
                 if self.peek_type(0)? != Some(TokenType::Comma) {
@@ -220,21 +244,17 @@ impl Parser {
             bail!("line {}: expected ) found {}", rp.line, rp.lexeme);
         }
 
-        // parse the function body
-        let body = match self.peek(0)? {
+        Ok(params)
+    }
+
+    fn fun_body(&mut self) -> Result<Stmt> {
+        Ok(match self.peek(0)? {
             None => bail!("unexpected end of input"),
             Some(tok) if tok.typ != TokenType::LeftBrace => {
                 bail!("line {}: expected {{ found {}", tok.line, tok.lexeme)
             }
-            Some(_) => {
-                self.funs += 1;
-                let block = self.block();
-                self.funs -= 1;
-                Stmt::Block(block?)
-            }
-        };
-
-        Ok(Stmt::Fun(name, params, Box::new(body)))
+            Some(_) => Stmt::Block(self.block()?),
+        })
     }
 
     fn statement(&mut self) -> Result<Stmt> {
@@ -278,7 +298,10 @@ impl Parser {
 
             // match blocks
             Some(TokenType::LeftBrace) => {
-                return Ok(Stmt::Block(self.block()?));
+                self.scope = Scope::push(&self.scope, "{");
+                let block = self.block();
+                self.scope = Scope::pop(&self.scope).unwrap();
+                return Ok(Stmt::Block(block?));
             }
 
             // everything else is an expression statement
@@ -478,7 +501,7 @@ impl Parser {
                 self.read()?;
                 let rhs = self.assignment()?;
                 match lhs {
-                    Expr::Variable(tok) => Ok(Expr::Assignment(tok, Box::new(rhs))),
+                    Expr::Variable(tok, qname) => Ok(Expr::Assignment(tok, qname, Box::new(rhs))),
                     _ => bail!("invalid assignment target: {}", lhs),
                 }
             }
@@ -585,7 +608,10 @@ impl Parser {
             TokenType::True => Expr::Literal(Value::Boolean(true)),
             TokenType::Number => Expr::Literal(tok.literal),
             TokenType::String => Expr::Literal(tok.literal),
-            TokenType::Identifier => Expr::Variable(tok),
+            TokenType::Identifier => {
+                let qname = self.scope.resolve(&tok.lexeme);
+                Expr::Variable(tok, qname)
+            }
             TokenType::LeftParen => self.grouping()?,
             _ => bail!(
                 "line {}: expected expression, found {}",
@@ -891,7 +917,7 @@ mod tests {
         ));
         assert!(matches!(
             parse_expr("x"),
-            Ok(Expr::Variable(tok)) if tok.lexeme == "x"
+            Ok(Expr::Variable(tok, _qname)) if tok.lexeme == "x"
         ));
     }
 
@@ -907,7 +933,7 @@ mod tests {
         match parse_expr("test()") {
             Ok(Expr::Call(callee, paren, args)) => {
                 match *callee {
-                    Expr::Variable(tok) => assert_eq!(tok.lexeme, "test"),
+                    Expr::Variable(tok, _qname) => assert_eq!(tok.lexeme, "test"),
                     _ => panic!(),
                 }
                 assert_eq!(paren.typ, TokenType::LeftParen);
@@ -1121,7 +1147,7 @@ mod tests {
         assert!(roundtrip_expr("y = x + 1"));
 
         match parse_expr("x = 1") {
-            Ok(Expr::Assignment(var, expr)) => {
+            Ok(Expr::Assignment(var, _qname, expr)) => {
                 assert_eq!(var.typ, TokenType::Identifier);
                 assert!(matches!(*expr, Expr::Literal(Value::Num(x)) if x == 1.0));
             }
@@ -1210,7 +1236,7 @@ mod tests {
         assert!(roundtrip("var y = 42;"));
 
         match &parse("var x;").unwrap().stmts[0] {
-            Stmt::Var(tok, expr) => {
+            Stmt::Var(tok, _qname, expr) => {
                 assert_eq!(tok.typ, TokenType::Identifier);
                 assert_eq!(tok.lexeme, "x");
                 match expr {
@@ -1222,7 +1248,7 @@ mod tests {
         }
 
         match &parse("var y = 42;").unwrap().stmts[0] {
-            Stmt::Var(tok, expr) => {
+            Stmt::Var(tok, _qname, expr) => {
                 assert_eq!(tok.typ, TokenType::Identifier);
                 assert_eq!(tok.lexeme, "y");
                 match expr {
@@ -1243,13 +1269,11 @@ mod tests {
             .unwrap()
             .stmts[0]
         {
-            Stmt::Fun(name, params, _body) => {
-                assert_eq!(name.typ, TokenType::Identifier);
-                assert_eq!(name.lexeme, "test");
-                assert_eq!(params[0].typ, TokenType::Identifier);
-                assert_eq!(params[0].lexeme, "a");
-                assert_eq!(params[1].typ, TokenType::Identifier);
-                assert_eq!(params[1].lexeme, "b");
+            Stmt::Fun(tok, _qname, params, _body) => {
+                assert_eq!(tok.typ, TokenType::Identifier);
+                assert_eq!(tok.lexeme, "test");
+                assert_eq!(params[0], "::test::a");
+                assert_eq!(params[1], "::test::b");
             }
             _ => panic!(),
         }
@@ -1274,7 +1298,7 @@ mod tests {
 
         match &parse("print x;").unwrap().stmts[0] {
             Stmt::Print(expr) => match expr {
-                Expr::Variable(tok) => assert_eq!(tok.lexeme, "x"),
+                Expr::Variable(tok, _qname) => assert_eq!(tok.lexeme, "x"),
                 _ => panic!(),
             },
             _ => panic!(),
@@ -1376,7 +1400,7 @@ mod tests {
         {
             Stmt::Block(stmts) => {
                 match &stmts[0] {
-                    Stmt::Var(tok, expr) => {
+                    Stmt::Var(tok, _qname, expr) => {
                         assert_eq!(tok.lexeme, "x");
                         match expr {
                             Expr::Literal(value) => assert_eq!(*value, Value::Num(1.0)),
@@ -1439,7 +1463,7 @@ mod tests {
                     _ => panic!(),
                 }
                 match *increment {
-                    Stmt::Expr(Expr::Assignment(var, expr)) => {
+                    Stmt::Expr(Expr::Assignment(var, _qname, expr)) => {
                         assert_eq!(var.lexeme, "x");
                         assert!(matches!(*expr, Expr::Literal(Value::Num(x)) if x == 1.0));
                     }
@@ -1458,7 +1482,7 @@ mod tests {
         match &parse("{ var x = 1; var y = 2; }").unwrap().stmts[0] {
             Stmt::Block(stmts) => {
                 match &stmts[0] {
-                    Stmt::Var(tok, expr) => {
+                    Stmt::Var(tok, _qname, expr) => {
                         assert_eq!(tok.typ, TokenType::Identifier);
                         assert_eq!(tok.lexeme, "x");
                         match expr {
@@ -1469,7 +1493,7 @@ mod tests {
                     _ => panic!(),
                 }
                 match &stmts[1] {
-                    Stmt::Var(tok, expr) => {
+                    Stmt::Var(tok, _qname, expr) => {
                         assert_eq!(tok.typ, TokenType::Identifier);
                         assert_eq!(tok.lexeme, "y");
                         match expr {

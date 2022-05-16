@@ -66,11 +66,11 @@ impl Env {
     # Returns
     The value of the requested variable, or error if it was not defined.
     */
-    pub fn get(&self, tok: &Token) -> Result<Value> {
-        match self.data.get(&tok.lexeme) {
+    pub fn get(&self, tok: &Token, qname: &str) -> Result<Value> {
+        match self.data.get(qname) {
             Some(value) => Ok(value.clone()),
             None => match &self.parent {
-                Some(parent) => Ok(parent.lock().unwrap().get(tok)?),
+                Some(parent) => Ok(parent.lock().unwrap().get(tok, qname)?),
                 None => bail!("line {}: undefined variable {}", tok.line, tok.lexeme),
             },
         }
@@ -87,13 +87,13 @@ impl Env {
     # Returns
     Ok if the variable was assigned, or error if was not defined.
     */
-    pub fn assign(&mut self, tok: &Token, value: Value) -> Result<()> {
-        if self.data.contains_key(&tok.lexeme) {
-            self.data.insert(tok.lexeme.to_string(), value);
+    pub fn assign(&mut self, tok: &Token, qname: &str, value: Value) -> Result<()> {
+        if self.data.contains_key(qname) {
+            self.data.insert(qname.to_string(), value);
             Ok(())
         } else {
             match &self.parent {
-                Some(parent) => parent.lock().unwrap().assign(tok, value),
+                Some(parent) => parent.lock().unwrap().assign(tok, qname, value),
                 None => bail!("line {}: undefined variable {}", tok.line, tok.lexeme),
             }
         }
@@ -123,23 +123,23 @@ mod tests {
         };
 
         assert!(env
-            .get(&x)
+            .get(&x, &x.lexeme)
             .unwrap_err()
             .to_string()
             .contains("undefined variable"));
         assert!(env
-            .assign(&x, Value::Num(2.0))
+            .assign(&x, &x.lexeme, Value::Num(2.0))
             .unwrap_err()
             .to_string()
             .contains("undefined variable"));
 
         env.define(&x.lexeme, x.literal.clone());
         env.define(&y.lexeme, y.literal.clone());
-        assert_eq!(env.get(&x).unwrap(), x.literal);
-        assert_eq!(env.get(&y).unwrap(), y.literal);
+        assert_eq!(env.get(&x, &x.lexeme).unwrap(), x.literal);
+        assert_eq!(env.get(&y, &y.lexeme).unwrap(), y.literal);
 
-        env.assign(&x, y.literal.clone()).unwrap();
-        assert_eq!(env.get(&x).unwrap(), y.literal);
+        env.assign(&x, &x.lexeme, y.literal.clone()).unwrap();
+        assert_eq!(env.get(&x, &x.lexeme).unwrap(), y.literal);
     }
 
     #[test]
@@ -163,12 +163,15 @@ mod tests {
 
         let env = Env::push(&env);
         env.lock().unwrap().define(&x.lexeme, y.literal.clone());
-        env.lock().unwrap().assign(&y, x.literal.clone()).unwrap();
-        assert_eq!(env.lock().unwrap().get(&x).unwrap(), y.literal);
-        assert_eq!(env.lock().unwrap().get(&y).unwrap(), x.literal);
+        env.lock()
+            .unwrap()
+            .assign(&y, &y.lexeme, x.literal.clone())
+            .unwrap();
+        assert_eq!(env.lock().unwrap().get(&x, &x.lexeme).unwrap(), y.literal);
+        assert_eq!(env.lock().unwrap().get(&y, &y.lexeme).unwrap(), x.literal);
 
         let env = Env::pop(&env).unwrap();
-        assert_eq!(env.lock().unwrap().get(&x).unwrap(), x.literal);
-        assert_eq!(env.lock().unwrap().get(&y).unwrap(), x.literal);
+        assert_eq!(env.lock().unwrap().get(&x, &x.lexeme).unwrap(), x.literal);
+        assert_eq!(env.lock().unwrap().get(&y, &y.lexeme).unwrap(), x.literal);
     }
 }
