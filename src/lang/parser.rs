@@ -6,7 +6,7 @@
 use crate::lang::{lexer, parser};
 
 let lexer = lexer::Lexer::from_str(r#"print "Hello World";"#);
-let expr = parser::Parser::new(Box::new(lexer)).parse()?;
+let expr = parser::Parser::new(lexer).parse()?;
 dbg!(expr);
 ```
 
@@ -27,6 +27,7 @@ at an arbitrary number of tokens ahead of the current position.
 pub struct Parser {
     reader: LookaheadReader<Token>,
     loops: u32,
+    funs: u32,
 }
 
 impl Parser {
@@ -39,10 +40,11 @@ impl Parser {
     # Returns
     The initialized parser.
     */
-    pub fn new(tokens: Box<dyn Iterator<Item = Result<Token>>>) -> Parser {
+    pub fn new(tokens: impl Iterator<Item = Result<Token>> + 'static) -> Parser {
         Self {
             reader: LookaheadReader::new(tokens),
             loops: 0,
+            funs: 0,
         }
     }
 
@@ -224,7 +226,12 @@ impl Parser {
             Some(tok) if tok.typ != TokenType::LeftBrace => {
                 bail!("line {}: expected {{ found {}", tok.line, tok.lexeme)
             }
-            Some(_) => Stmt::Block(self.block()?),
+            Some(_) => {
+                self.funs += 1;
+                let block = self.block();
+                self.funs -= 1;
+                Stmt::Block(block?)
+            }
         };
 
         Ok(Stmt::Fun(name, params, Box::new(body)))
@@ -263,6 +270,10 @@ impl Parser {
 
             Some(TokenType::For) => {
                 return self.for_();
+            }
+
+            Some(TokenType::Return) => {
+                return self.return_();
             }
 
             // match blocks
@@ -413,6 +424,31 @@ impl Parser {
         };
 
         Ok(block)
+    }
+
+    fn return_(&mut self) -> Result<Stmt> {
+        let ret = self.read()?;
+
+        if self.funs == 0 {
+            bail!("line {}: return invalid outside function", ret.line);
+        }
+
+        let value = if matches!(self.peek_type(0)?, Some(TokenType::Semicolon)) {
+            Expr::Literal(Value::Nil)
+        } else {
+            self.expression()?
+        };
+
+        let end = self.read()?;
+        if end.typ != TokenType::Semicolon {
+            bail!(
+                "line {}: expected ; after return, found {}",
+                end.line,
+                end.lexeme
+            );
+        }
+
+        Ok(Stmt::Return(ret, value))
     }
 
     fn block(&mut self) -> Result<Vec<Stmt>> {
@@ -881,7 +917,7 @@ mod tests {
         }
 
         match parse_expr("test(1, 2)") {
-            Ok(Expr::Call(callee, paren, args)) => {
+            Ok(Expr::Call(_callee, _paren, args)) => {
                 assert_eq!(args.len(), 2);
                 assert!(matches!(args[0], Expr::Literal(Value::Num(x)) if x == 1.0));
                 assert!(matches!(args[1], Expr::Literal(Value::Num(x)) if x == 2.0));
@@ -1207,7 +1243,7 @@ mod tests {
             .unwrap()
             .stmts[0]
         {
-            Stmt::Fun(name, params, body) => {
+            Stmt::Fun(name, params, _body) => {
                 assert_eq!(name.typ, TokenType::Identifier);
                 assert_eq!(name.lexeme, "test");
                 assert_eq!(params[0].typ, TokenType::Identifier);
@@ -1455,7 +1491,7 @@ mod tests {
     }
 
     fn parse(string: &str) -> Result<Program> {
-        Parser::new(Box::new(Lexer::from_str(string))).parse()
+        Parser::new(Lexer::from_str(string)).parse()
     }
 
     fn roundtrip(string: &str) -> bool {
@@ -1463,7 +1499,7 @@ mod tests {
     }
 
     fn parse_expr(string: &str) -> Result<Expr> {
-        Parser::new(Box::new(Lexer::from_str(string))).parse_expr()
+        Parser::new(Lexer::from_str(string)).parse_expr()
     }
 
     fn roundtrip_expr(string: &str) -> bool {

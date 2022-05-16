@@ -46,12 +46,24 @@ impl Server {
 
         let (shutdown_requested_sender, shutdown_requested_receiver) = mpsc::channel();
 
+        let latest_execution_request = Arc::new(Mutex::new(None));
         let server = Server {
-            iopub,
-            latest_execution_request: Arc::new(Mutex::new(None)),
+            iopub: iopub.clone(),
+            latest_execution_request: latest_execution_request.clone(),
             shutdown_requested_receiver: Arc::new(Mutex::new(shutdown_requested_receiver)),
             shutdown_requested_sender: Arc::new(Mutex::new(shutdown_requested_sender)),
-            interpreter: Arc::new(Mutex::new(interp::Interpreter::new())),
+            interpreter: Arc::new(Mutex::new(interp::Interpreter::new(move |text: &str| {
+                if let Some(message) = &*latest_execution_request.lock().unwrap() {
+                    message
+                        .new_message("stream")
+                        .with_content(object! {
+                            "name" => "stdout",
+                            "text" => text,
+                        })
+                        .send(&*iopub.lock().unwrap())
+                        .unwrap();
+                }
+            }))),
         };
 
         let (execution_sender, execution_receiver) = mpsc::channel();
@@ -95,7 +107,7 @@ impl Server {
         F: FnOnce(Server) -> Result<()> + std::marker::Send + 'static,
     {
         let server_clone = self.clone();
-        thread::spawn(|| {
+        thread::spawn(move || {
             if let Err(error) = body(server_clone) {
                 eprintln!("{:?}", error);
             }
@@ -132,9 +144,8 @@ impl Server {
                 .send(&*self.iopub.lock().unwrap())?;
 
             match self.process(src) {
-                Ok(result) => {
-                    let data: HashMap<&str, &str> =
-                        HashMap::from([("text/plain", result.as_str())]);
+                Ok(()) => {
+                    let data: HashMap<&str, &str> = HashMap::from([("text/plain", "")]);
                     message
                         .new_message("execute_result")
                         .with_content(object! {
@@ -166,11 +177,6 @@ impl Server {
                 }
             }
         }
-    }
-
-    fn process(&mut self, src: &str) -> Result<String> {
-        let program = parser::Parser::new(Box::new(lexer::Lexer::from_str(src))).parse()?;
-        self.interpreter.lock().unwrap().eval(&program)
     }
 
     fn handle_shell(
@@ -249,6 +255,11 @@ impl Server {
                 }
             }
         }
+    }
+
+    fn process(&mut self, src: &str) -> Result<()> {
+        let program = parser::Parser::new(lexer::Lexer::from_str(src)).parse()?;
+        self.interpreter.lock().unwrap().eval(&program)
     }
 }
 

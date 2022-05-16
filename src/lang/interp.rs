@@ -6,7 +6,7 @@
 use crate::lang::{lexer, parser, interp};
 
 let lexer = lexer::Lexer::from_str(r"2 + 2 == 5");
-let program = parser::Parser::new(Box::new(lexer)).parse()?;
+let program = parser::Parser::new(lexer).parse()?;
 let interpreter = interp::Interpreter::new();
 let result = interpreter.eval(&program)?;
 dbg!(result);
@@ -14,21 +14,21 @@ dbg!(result);
 
 */
 
-use std::cell::RefCell;
+use std::sync::{Arc, Mutex};
 
 use anyhow::{bail, Result};
 
 use crate::lang::env::Env;
 use crate::lang::{Expr, Program, Stmt, Token, TokenType as TT, Value, Value::*};
 
-type ValueCell = RefCell<Value>;
-
 /**
 This struct maintains the current state of the interpreter between program evaluations.
  */
 pub struct Interpreter {
-    env: Env,
+    env: Arc<Mutex<Env>>,
     breaking: Option<bool>,
+    retval: Option<Value>,
+    printer: Box<dyn FnMut(&str) + Send + Sync>,
 }
 
 impl Interpreter {
@@ -38,10 +38,12 @@ impl Interpreter {
     # Returns
     The initialized interpreter.
     */
-    pub fn new() -> Self {
+    pub fn new(printer: impl FnMut(&str) + Send + Sync + 'static) -> Self {
         Self {
-            env: Env::default(),
+            env: Arc::new(Mutex::new(Env::default())),
             breaking: None,
+            retval: None,
+            printer: Box::new(printer),
         }
     }
 
@@ -54,96 +56,108 @@ impl Interpreter {
     # Returns
     The contents of stdout after the program was run.
     */
-    pub fn eval(&mut self, program: &Program) -> Result<String> {
+    pub fn eval(&mut self, program: &Program) -> Result<()> {
         self.eval_stmts(&program.stmts)
     }
 
-    fn eval_stmts(&mut self, stmts: &[Stmt]) -> Result<String> {
-        let mut stdout = String::new();
-
+    fn eval_stmts(&mut self, stmts: &[Stmt]) -> Result<()> {
         for stmt in stmts.iter() {
-            stdout.push_str(&self.eval_stmt(stmt)?);
-            if self.breaking.is_some() {
+            self.eval_stmt(stmt)?;
+            if self.breaking.is_some() || self.retval.is_some() {
                 break;
             }
         }
 
-        Ok(stdout)
+        Ok(())
     }
 
-    fn eval_stmt(&mut self, stmt: &Stmt) -> Result<String> {
-        Ok(match stmt {
-            Stmt::Block(stmts) => {
-                // push a new child environment, eval, and then restore the old environment
-                self.env = std::mem::take(&mut self.env).push();
-                let stdout = self.eval_stmts(stmts);
-                self.env = std::mem::take(&mut self.env).pop().unwrap();
-                stdout?
-            }
-            Stmt::Break(cont) => {
-                self.breaking = Some(*cont);
-                "".to_string()
-            }
-            Stmt::Var(tok, expr) => {
-                // define a new variable in the current environment
-                let value = self.eval_expr(expr)?;
-                self.env.define(&tok.lexeme, value);
-                "".to_string()
-            }
-            Stmt::Fun(name, params, body) => {
-                // TODO: implement
-                "".to_string()
-            }
-            Stmt::Expr(expr) => {
-                // just evaluate for effects
-                self.eval_expr(expr)?;
-                "".to_string()
-            }
-            Stmt::If(cond, cons, alt) => {
-                // eval the consequent or the alternative based on the conditional
-                let cond = self.eval_expr(cond)?;
-                if self.eval_truthy(&*cond.borrow()) {
-                    self.eval_stmt(cons)?
-                } else if let Some(alt) = alt {
-                    self.eval_stmt(alt)?
-                } else {
-                    "".to_string()
-                }
-            }
-            Stmt::Print(expr) => {
-                // evaluate and write to stdout
-                let value = self.eval_expr(expr)?;
-                let value = &*value.borrow();
-                match value {
-                    Value::Str(string) => format!("{}\n", string),
-                    value => format!("{}\n", value),
-                }
-            }
-            Stmt::While(cond, body, post) => {
-                // evaluate the body as long as the condition is true
-                let mut stdout = String::new();
-                loop {
-                    // evaluate the loop condition
-                    let cond = self.eval_expr(cond)?;
-                    if !self.eval_truthy(&*cond.borrow()) {
-                        break stdout;
-                    }
+    fn eval_stmt(&mut self, stmt: &Stmt) -> Result<()> {
+        match stmt {
+            Stmt::Block(stmts) => self.eval_block(stmts),
+            Stmt::Break(cont) => self.eval_break(*cont),
+            Stmt::Var(tok, expr) => self.eval_var(tok, expr),
+            Stmt::Fun(name, _params, _body) => self.eval_fun(name, stmt),
+            Stmt::Expr(expr) => self.eval_expr(expr).map(|_| ()),
+            Stmt::If(cond, cons, alt) => self.eval_if(cond, cons, alt),
+            Stmt::Print(expr) => self.eval_print(expr),
+            Stmt::While(cond, body, post) => self.eval_while(cond, body, post),
+            Stmt::Return(_tok, value) => self.eval_return(value),
+        }
+    }
 
-                    // evaluate the loop body
-                    stdout.push_str(&self.eval_stmt(body)?);
+    fn eval_block(&mut self, stmts: &[Stmt]) -> Result<()> {
+        self.env = Env::push(&self.env);
+        let result = self.eval_stmts(stmts);
+        self.env = Env::pop(&self.env).unwrap();
+        result
+    }
 
-                    // if we are breaking (not continuing), bail out
-                    if let Some(false) = std::mem::replace(&mut self.breaking, None) {
-                        break stdout;
-                    }
+    fn eval_break(&mut self, cont: bool) -> Result<()> {
+        self.breaking = Some(cont);
+        Ok(())
+    }
 
-                    // evaluate the optional loop post-processing (for continue inside for-loop)
-                    if let Some(post) = post {
-                        stdout.push_str(&self.eval_stmt(post)?);
-                    }
-                }
+    fn eval_var(&mut self, tok: &Token, expr: &Expr) -> Result<()> {
+        let value = self.eval_expr(expr)?;
+        self.env.lock().unwrap().define(&tok.lexeme, value);
+        Ok(())
+    }
+
+    fn eval_fun(&mut self, name: &Token, stmt: &Stmt) -> Result<()> {
+        let value = Value::Fun(Box::new(stmt.clone()), self.env.clone());
+        self.env.lock().unwrap().define(&name.lexeme, value);
+        Ok(())
+    }
+
+    fn eval_if(&mut self, cond: &Expr, cons: &Stmt, alt: &Option<Box<Stmt>>) -> Result<()> {
+        let cond = self.eval_expr(cond)?;
+        if self.eval_truthy(&cond) {
+            self.eval_stmt(cons)?;
+        } else if let Some(alt) = alt {
+            self.eval_stmt(alt)?;
+        }
+        Ok(())
+    }
+
+    fn eval_print(&mut self, expr: &Expr) -> Result<()> {
+        let value = self.eval_expr(expr)?;
+        let value = value;
+        let stdout = match value {
+            Value::Str(string) => format!("{}\n", string),
+            value => format!("{}\n", value),
+        };
+        (self.printer)(&stdout);
+        Ok(())
+    }
+
+    fn eval_while(&mut self, cond: &Expr, body: &Stmt, post: &Option<Box<Stmt>>) -> Result<()> {
+        loop {
+            // evaluate the loop condition
+            let cond = self.eval_expr(cond)?;
+            if !self.eval_truthy(&cond) {
+                break;
             }
-        })
+
+            // evaluate the loop body
+            self.eval_stmt(body)?;
+
+            // if we are breaking (not continuing), bail out
+            if let Some(false) = std::mem::replace(&mut self.breaking, None) {
+                break;
+            }
+
+            // evaluate the optional loop post-processing (for continue inside for-loop)
+            if let Some(post) = post {
+                self.eval_stmt(post)?;
+            }
+        }
+
+        Ok(())
+    }
+
+    fn eval_return(&mut self, expr: &Expr) -> Result<()> {
+        self.retval = Some(self.eval_expr(expr)?);
+        Ok(())
     }
 
     /**
@@ -155,44 +169,42 @@ impl Interpreter {
     # Returns
     The result value of the evaluated expression.
     */
-    pub fn eval_expr(&mut self, expr: &Expr) -> Result<ValueCell> {
+    pub fn eval_expr(&mut self, expr: &Expr) -> Result<Value> {
         Ok(match expr {
             Expr::Assignment(var, expr) => self.eval_assign(var, expr)?,
             Expr::Binary(lhs, tok, rhs) => self.eval_binary(lhs, tok, rhs)?,
             Expr::Call(callee, tok, args) => self.eval_call(callee, tok, args)?,
             Expr::Grouping(expr) => self.eval_expr(expr)?,
-            Expr::Literal(value) => ValueCell::new(value.clone()),
+            Expr::Literal(value) => value.clone(),
             Expr::Logical(lhs, tok, rhs) => self.eval_logical(lhs, tok, rhs)?,
             Expr::Unary(tok, expr) => self.eval_unary(tok, expr)?,
-            Expr::Variable(tok) => self.env.get(tok)?,
+            Expr::Variable(tok) => self.env.lock().unwrap().get(tok)?,
         })
     }
 
-    fn eval_assign(&mut self, var: &Token, expr: &Expr) -> Result<ValueCell> {
+    fn eval_assign(&mut self, var: &Token, expr: &Expr) -> Result<Value> {
         let value = self.eval_expr(expr)?;
-        self.env.assign(var, value.clone())?;
+        self.env.lock().unwrap().assign(var, value.clone())?;
         Ok(value)
     }
 
-    fn eval_binary(&mut self, lhs: &Expr, tok: &Token, rhs: &Expr) -> Result<ValueCell> {
+    fn eval_binary(&mut self, lhs: &Expr, tok: &Token, rhs: &Expr) -> Result<Value> {
         let lhs = self.eval_expr(lhs)?;
         let rhs = self.eval_expr(rhs)?;
-        let lhs = &*lhs.borrow();
-        let rhs = &*rhs.borrow();
         Ok(match tok.typ {
-            TT::Plus | TT::Slash | TT::Star | TT::Minus => self.eval_arithmetic(lhs, tok, rhs)?,
+            TT::Plus | TT::Slash | TT::Star | TT::Minus => self.eval_arithmetic(&lhs, tok, &rhs)?,
             TT::Greater | TT::GreaterEqual | TT::Less | TT::LessEqual => {
-                self.eval_comparison(lhs, tok, rhs)?
+                self.eval_comparison(&lhs, tok, &rhs)?
             }
-            TT::EqualEqual => ValueCell::new(Boolean(self.eval_equality(lhs, rhs))),
-            TT::BangEqual => ValueCell::new(Boolean(!self.eval_equality(lhs, rhs))),
+            TT::EqualEqual => Boolean(self.eval_equality(&lhs, &rhs)),
+            TT::BangEqual => Boolean(!self.eval_equality(&lhs, &rhs)),
             typ => panic!("invalid binary: {}", typ),
         })
     }
 
-    fn eval_logical(&mut self, lhs: &Expr, tok: &Token, rhs: &Expr) -> Result<ValueCell> {
+    fn eval_logical(&mut self, lhs: &Expr, tok: &Token, rhs: &Expr) -> Result<Value> {
         let lhs = self.eval_expr(lhs)?;
-        let lhb = self.eval_truthy(&*lhs.borrow());
+        let lhb = self.eval_truthy(&lhs);
         Ok(match (lhb, tok.typ) {
             (true, TT::Or) => lhs,
             (false, TT::And) => lhs,
@@ -201,13 +213,12 @@ impl Interpreter {
         })
     }
 
-    fn eval_unary(&mut self, tok: &Token, expr: &Expr) -> Result<ValueCell> {
+    fn eval_unary(&mut self, tok: &Token, expr: &Expr) -> Result<Value> {
         let value = self.eval_expr(expr)?;
-        let value = &*value.borrow();
         Ok(match tok.typ {
-            TT::Bang => ValueCell::new(Boolean(!self.eval_truthy(value))),
+            TT::Bang => Boolean(!self.eval_truthy(&value)),
             TT::Minus => match value {
-                Num(num) => ValueCell::new(Num(-num)),
+                Num(num) => Num(-num),
                 value => bail!(
                     "line {}: expected number, found: {}{}",
                     tok.line,
@@ -229,8 +240,8 @@ impl Interpreter {
         }
     }
 
-    fn eval_comparison(&mut self, lhs: &Value, tok: &Token, rhs: &Value) -> Result<ValueCell> {
-        Ok(ValueCell::new(Boolean(match (lhs, tok.typ, rhs) {
+    fn eval_comparison(&mut self, lhs: &Value, tok: &Token, rhs: &Value) -> Result<Value> {
+        Ok(Boolean(match (lhs, tok.typ, rhs) {
             (Num(lhs), TT::Less, Num(rhs)) => lhs < rhs,
             (Num(lhs), TT::LessEqual, Num(rhs)) => lhs <= rhs,
             (Num(lhs), TT::Greater, Num(rhs)) => lhs > rhs,
@@ -246,11 +257,11 @@ impl Interpreter {
                 tok.lexeme,
                 rhs
             ),
-        })))
+        }))
     }
 
-    fn eval_arithmetic(&mut self, lhs: &Value, tok: &Token, rhs: &Value) -> Result<ValueCell> {
-        Ok(ValueCell::new(match (lhs, tok.typ, rhs) {
+    fn eval_arithmetic(&mut self, lhs: &Value, tok: &Token, rhs: &Value) -> Result<Value> {
+        Ok(match (lhs, tok.typ, rhs) {
             (Num(lhs), TT::Plus, Num(rhs)) => Num(lhs + rhs),
             (Num(lhs), TT::Minus, Num(rhs)) => Num(lhs - rhs),
             (Num(lhs), TT::Star, Num(rhs)) => Num(lhs * rhs),
@@ -263,12 +274,41 @@ impl Interpreter {
                 tok.lexeme,
                 rhs
             ),
-        }))
+        })
     }
 
-    fn eval_call(&mut self, callee: &Expr, tok: &Token, args: &Vec<Expr>) -> Result<ValueCell> {
-        // TODO: implement
-        Ok(ValueCell::new(Value::Nil))
+    fn eval_call(&mut self, callee: &Expr, tok: &Token, args: &[Expr]) -> Result<Value> {
+        let callee = self.eval_expr(callee)?;
+        match callee {
+            Value::Fun(stmt, env) => {
+                let env = Env::push(&env);
+                match *stmt {
+                    Stmt::Fun(name, params, body) => {
+                        if args.len() != params.len() {
+                            bail!(
+                                "line {}: in call to {}, expected {} arguments, found {}",
+                                tok.line,
+                                name.lexeme,
+                                params.len(),
+                                args.len()
+                            );
+                        }
+
+                        for (p, a) in params.iter().zip(args.iter()) {
+                            env.lock().unwrap().define(&p.lexeme, self.eval_expr(a)?);
+                        }
+
+                        let env = std::mem::replace(&mut self.env, env);
+                        let result = self.eval_stmt(&body);
+                        self.env = env;
+                        let value = self.retval.take();
+                        result.and(Ok(value.unwrap_or(Value::Nil)))
+                    }
+                    _ => panic!("invalid function statement"),
+                }
+            }
+            _ => bail!("line {}: expected callable (function or class)", tok.line),
+        }
     }
 
     fn eval_truthy(&mut self, value: &Value) -> bool {
@@ -575,13 +615,20 @@ mod tests {
     }
 
     fn eval_str(string: &str) -> Result<String> {
-        Interpreter::new().eval(&Parser::new(Box::new(Lexer::from_str(string))).parse()?)
+        let s = Arc::new(Mutex::new("".to_string()));
+        let r = s.clone();
+
+        Interpreter::new(move |t: &str| {
+            s.lock().unwrap().push_str(t);
+        })
+        .eval(&Parser::new(Lexer::from_str(string)).parse()?)?;
+
+        let r = r.lock().unwrap().clone();
+        Ok(r)
     }
 
     fn eval_expr_str(string: &str) -> Result<Value> {
-        Ok(Interpreter::new()
-            .eval_expr(&Parser::new(Box::new(Lexer::from_str(string))).parse_expr()?)?
-            .borrow()
-            .clone())
+        Ok(Interpreter::new(|_| {})
+            .eval_expr(&Parser::new(Lexer::from_str(string)).parse_expr()?)?)
     }
 }

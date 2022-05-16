@@ -103,7 +103,7 @@ impl Lexer {
     The initialized lexer.
     */
     pub fn from_str(text: &str) -> Self {
-        Self::from_read(Box::new(std::io::Cursor::new(text.to_string())))
+        Self::from_read(std::io::Cursor::new(text.to_string()))
     }
 
     /**
@@ -115,9 +115,9 @@ impl Lexer {
     # Returns
     The initialized lexer.
     */
-    pub fn from_read(read: Box<dyn std::io::Read>) -> Self {
+    pub fn from_read(read: impl std::io::Read + 'static) -> Self {
         Self {
-            reader: LookaheadReader::new(Box::new(CharReaderIterator::new(Box::new(read)))),
+            reader: LookaheadReader::new(CharReaderIterator::new(read)),
             line: 1,
             column: 0,
         }

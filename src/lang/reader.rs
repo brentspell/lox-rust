@@ -26,9 +26,9 @@ impl<T> LookaheadReader<T> {
     # Returns
     The initialized reader.
     */
-    pub fn new(iter: Box<dyn Iterator<Item = Result<T>>>) -> Self {
+    pub fn new(iter: impl Iterator<Item = Result<T>> + 'static) -> Self {
         Self {
-            iter,
+            iter: Box::new(iter),
             lookahead: VecDeque::new(),
         }
     }
@@ -88,9 +88,9 @@ impl CharReaderIterator {
     # Returns
     The initialized iterator.
     */
-    pub fn new(read: Box<dyn std::io::Read>) -> Self {
+    pub fn new(read: impl std::io::Read + 'static) -> Self {
         CharReaderIterator {
-            read: char_reader::CharReader::new(read),
+            read: char_reader::CharReader::new(Box::new(read)),
         }
     }
 }

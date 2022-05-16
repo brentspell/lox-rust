@@ -2,8 +2,8 @@
 # Lox language data model and helpers.
 */
 
-use std::cell::RefCell;
 use std::fmt;
+use std::sync::{Arc, Mutex};
 
 mod env;
 pub mod interp;
@@ -11,7 +11,7 @@ pub mod lexer;
 pub mod parser;
 mod reader;
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Program {
     stmts: Vec<Stmt>,
 }
@@ -38,6 +38,7 @@ pub enum Stmt {
     Print(Expr),
     While(Expr, Box<Stmt>, Option<Box<Stmt>>),
     Fun(Token, Vec<Token>, Box<Stmt>),
+    Return(Token, Expr),
 }
 
 impl fmt::Display for Stmt {
@@ -45,7 +46,7 @@ impl fmt::Display for Stmt {
         match self {
             Self::Block(stmts) => {
                 writeln!(f, "{{")?;
-                for (i, e) in stmts.iter().enumerate() {
+                for e in stmts.iter() {
                     writeln!(f, "{}", e)?;
                 }
                 writeln!(f, "}}")?;
@@ -65,8 +66,8 @@ impl fmt::Display for Stmt {
             Self::Print(expr) => write!(f, "print {};", expr),
             Self::While(cond, body, None) => write!(f, "while ({}) {}", cond, body),
             Self::While(cond, body, Some(post)) => write!(f, "while ({}) {} {}", cond, body, post),
-            Self::Fun(name, params, body) => {
-                write!(f, "fun {}(", name.lexeme)?;
+            Self::Fun(tok, params, body) => {
+                write!(f, "fun {}(", tok.lexeme)?;
                 for (i, e) in params.iter().enumerate() {
                     if i > 0 {
                         write!(f, ", ")?;
@@ -76,6 +77,7 @@ impl fmt::Display for Stmt {
                 write!(f, ") {}", body)?;
                 Ok(())
             }
+            Self::Return(_tok, expr) => write!(f, "return {};", expr),
         }
     }
 }
@@ -235,7 +237,7 @@ pub enum Value {
     Boolean(bool),
     Num(f64),
     Str(String),
-    Fun(RefCell<Box<Stmt>>),
+    Fun(Box<Stmt>, Arc<Mutex<crate::lang::env::Env>>),
 }
 
 impl PartialEq for Value {
@@ -263,7 +265,7 @@ impl fmt::Display for Value {
                 }
             }
             Value::Str(value) => format!("\"{value}\""),
-            Value::Fun(stmt) => match &**stmt.borrow() {
+            Value::Fun(stmt, _env) => match &**stmt {
                 Stmt::Fun(name, _, _) => format!("<function {}>", name.lexeme),
                 _ => panic!("invalid function value"),
             },

@@ -7,14 +7,12 @@ used or assigned to. If values are not defined in the current environment, the g
 is forwarded to the parent environment.
 */
 
-use std::cell::RefCell;
 use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 
 use anyhow::{bail, Result};
 
 use crate::lang::{Token, Value};
-
-type ValueCell = RefCell<Value>;
 
 /**
 This struct stores the values of all variables used by the interpreter. Scoping is accomplished
@@ -23,26 +21,26 @@ an empty mapping.
 */
 #[derive(Debug, Default)]
 pub struct Env {
-    parent: Option<Box<Env>>,
-    data: HashMap<String, ValueCell>,
+    parent: Option<Arc<Mutex<Env>>>,
+    data: HashMap<String, Value>,
 }
 
 impl Env {
     /**
     Enters a new block scope, which contains a reference to the current scope as parent.
     */
-    pub fn push(self) -> Self {
-        Env {
-            parent: Some(Box::new(self)),
+    pub fn push(env: &Arc<Mutex<Self>>) -> Arc<Mutex<Self>> {
+        Arc::new(Mutex::new(Self {
+            parent: Some(env.clone()),
             data: HashMap::new(),
-        }
+        }))
     }
 
     /**
     Exits the current block scope, returning the parent environment as the new scope.
     */
-    pub fn pop(self) -> Option<Self> {
-        self.parent.map(|p| *p)
+    pub fn pop(env: &Arc<Mutex<Self>>) -> Option<Arc<Mutex<Self>>> {
+        env.lock().unwrap().parent.clone()
     }
 
     /**
@@ -54,7 +52,7 @@ impl Env {
     * `value` - the value to assign
 
     */
-    pub fn define(&mut self, name: &str, value: ValueCell) {
+    pub fn define(&mut self, name: &str, value: Value) {
         self.data.insert(name.to_string(), value);
     }
 
@@ -68,11 +66,11 @@ impl Env {
     # Returns
     The value of the requested variable, or error if it was not defined.
     */
-    pub fn get(&self, tok: &Token) -> Result<ValueCell> {
+    pub fn get(&self, tok: &Token) -> Result<Value> {
         match self.data.get(&tok.lexeme) {
             Some(value) => Ok(value.clone()),
             None => match &self.parent {
-                Some(parent) => Ok(parent.get(tok)?),
+                Some(parent) => Ok(parent.lock().unwrap().get(tok)?),
                 None => bail!("line {}: undefined variable {}", tok.line, tok.lexeme),
             },
         }
@@ -89,13 +87,13 @@ impl Env {
     # Returns
     Ok if the variable was assigned, or error if was not defined.
     */
-    pub fn assign(&mut self, tok: &Token, value: ValueCell) -> Result<()> {
+    pub fn assign(&mut self, tok: &Token, value: Value) -> Result<()> {
         if self.data.contains_key(&tok.lexeme) {
             self.data.insert(tok.lexeme.to_string(), value);
             Ok(())
         } else {
-            match &mut self.parent {
-                Some(parent) => parent.assign(tok, value),
+            match &self.parent {
+                Some(parent) => parent.lock().unwrap().assign(tok, value),
                 None => bail!("line {}: undefined variable {}", tok.line, tok.lexeme),
             }
         }
@@ -130,23 +128,23 @@ mod tests {
             .to_string()
             .contains("undefined variable"));
         assert!(env
-            .assign(&x, ValueCell::new(Value::Num(2.0)))
+            .assign(&x, Value::Num(2.0))
             .unwrap_err()
             .to_string()
             .contains("undefined variable"));
 
-        env.define(&x.lexeme, ValueCell::new(x.literal.clone()));
-        env.define(&y.lexeme, ValueCell::new(y.literal.clone()));
-        assert_eq!(*env.get(&x).unwrap().borrow(), x.literal);
-        assert_eq!(*env.get(&y).unwrap().borrow(), y.literal);
+        env.define(&x.lexeme, x.literal.clone());
+        env.define(&y.lexeme, y.literal.clone());
+        assert_eq!(env.get(&x).unwrap(), x.literal);
+        assert_eq!(env.get(&y).unwrap(), y.literal);
 
-        env.assign(&x, ValueCell::new(y.literal.clone())).unwrap();
-        assert_eq!(*env.get(&x).unwrap().borrow(), y.literal);
+        env.assign(&x, y.literal.clone()).unwrap();
+        assert_eq!(env.get(&x).unwrap(), y.literal);
     }
 
     #[test]
     fn test_push_pop() {
-        let mut env = Env::default();
+        let env = Arc::new(Mutex::new(Env::default()));
         let x = Token {
             typ: TokenType::Identifier,
             line: 1,
@@ -160,17 +158,17 @@ mod tests {
             literal: Value::Num(2.0),
         };
 
-        env.define(&x.lexeme, ValueCell::new(x.literal.clone()));
-        env.define(&y.lexeme, ValueCell::new(y.literal.clone()));
+        env.lock().unwrap().define(&x.lexeme, x.literal.clone());
+        env.lock().unwrap().define(&y.lexeme, y.literal.clone());
 
-        let mut env = env.push();
-        env.define(&x.lexeme, ValueCell::new(y.literal.clone()));
-        env.assign(&y, ValueCell::new(x.literal.clone())).unwrap();
-        assert_eq!(*env.get(&x).unwrap().borrow(), y.literal);
-        assert_eq!(*env.get(&y).unwrap().borrow(), x.literal);
+        let env = Env::push(&env);
+        env.lock().unwrap().define(&x.lexeme, y.literal.clone());
+        env.lock().unwrap().assign(&y, x.literal.clone()).unwrap();
+        assert_eq!(env.lock().unwrap().get(&x).unwrap(), y.literal);
+        assert_eq!(env.lock().unwrap().get(&y).unwrap(), x.literal);
 
-        let env = env.pop().unwrap();
-        assert_eq!(*env.get(&x).unwrap().borrow(), x.literal);
-        assert_eq!(*env.get(&y).unwrap().borrow(), x.literal);
+        let env = Env::pop(&env).unwrap();
+        assert_eq!(env.lock().unwrap().get(&x).unwrap(), x.literal);
+        assert_eq!(env.lock().unwrap().get(&y).unwrap(), x.literal);
     }
 }
